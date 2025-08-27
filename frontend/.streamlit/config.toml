@@ -1,0 +1,10 @@
+[server]
+headless = true
+port = 8501
+enableXsrfProtection = false
+enableCORS = false
+# if reverse proxy / HTTPS:
+# useForwardedHeaders = true
+
+[browser]
+gatherUsageStats = false

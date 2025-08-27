@@ -1,0 +1,53 @@
+version: "3.9"
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-supersecret}
+      POSTGRES_DB: ${POSTGRES_DB:-appdb}
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-app} -d ${POSTGRES_DB:-appdb}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    env_file:
+      - backend/.env
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg2://app:supersecret@db:5432/appdb
+      # Allow Streamlit to call the API from its origin:
+      CORS_ORIGINS: "http://localhost:8505,http://frontend:8505"
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      API_BASE_URL: "http://api:8000" # <— use service name, not localhost
+    command: >
+      sh -c "python -m streamlit run app.py
+            --server.port=8505
+            --server.address=0.0.0.0
+            --browser.gatherUsageStats=false"
+    ports:
+      - "8505:8501"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  dbdata:
