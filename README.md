@@ -74,8 +74,9 @@ starlette==0.38.*
 
 ## Run locally (SQLite quick start)
 
+From root folder:
+
 ```bash
-cd backend
 uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
