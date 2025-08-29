@@ -9,13 +9,6 @@ class User(Base):
     balance = Column(Float, nullable=False)
     created_at = Column(String, nullable=False)
 
-# models.py
-from sqlalchemy import (
-    Column, Integer, Float, String, ForeignKey, Index, UniqueConstraint
-)
-from sqlalchemy.orm import relationship
-from .db import Base
-
 class Market(Base):
     __tablename__ = "markets"  # <- if your real table is "market", use that consistently
 

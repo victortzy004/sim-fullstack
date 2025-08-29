@@ -1,16 +1,35 @@
-from fastapi import FastAPI, Depends, HTTPException, Body, APIRouter, status, Path
+from fastapi import FastAPI, Depends, HTTPException, Body, status, Path
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from typing import List
+from typing import List, Annotated
 from datetime import datetime, timedelta
+import secrets, os
+from textwrap import dedent
+from dotenv import load_dotenv, find_dotenv
 
 from .db import Base, engine, get_db
 from .models import User, Market, Reserve, Holding, Tx
 from .schemas import *
-from .logic import ensure_seed, do_trade, compute_user_points, is_market_active, is_market_active_with_reason, STARTING_BALANCE, MARKET_DURATION_DAYS, TOKENS
+from .logic import do_trade, compute_user_points, is_market_active, metrics_from_qty, STARTING_BALANCE, MARKET_DURATION_DAYS, TOKENS
 
 from fastapi.middleware.cors import CORSMiddleware
-    
+
+
+
+# Option A: auto-find .env by walking up from this file
+load_dotenv(find_dotenv(), override=False)
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+if not ADMIN_PASSWORD:
+    # raise or log clearly so you catch it early
+    print("WARNING: ADMIN_PASSWORD is not set; admin endpoints will fail")
+
+def _assert_admin(pw: str):
+    if not ADMIN_PASSWORD:
+        raise HTTPException(status_code=500, detail="Admin password not configured")
+    if not pw:
+        raise HTTPException(status_code=401, detail="Missing admin password")
+    if not secrets.compare_digest(pw, ADMIN_PASSWORD):
+        raise HTTPException(status_code=401, detail="Invalid admin password")
 
 def _now_iso():
     # no timezone suffix, matches _parse_ts above
@@ -18,22 +37,54 @@ def _now_iso():
 
 
 
+
+OPENAPI_TAGS = [
+    {"name": "System",        "description": "Health/liveness and meta endpoints."},
+    {"name": "Users",         "description": "Manage user accounts and balances."},
+    {"name": "Market",        "description": "Start, reset, resolve, and inspect markets."},
+    {"name": "Trading",       "description": "Execute trades and preview bonding-curve metrics."},
+    {"name": "Holdings",      "description": "Query user token holdings."},
+    {"name": "Transactions",  "description": "Retrieve transaction logs (buys/sells/resolves)."},
+    {"name": "Leaderboard",   "description": "Points and rankings across users."},
+    {"name": "Admin",         "description": "Privileged market control (start/reset/resolve)."},
+]
+
+API_VERSION = "1.1.0"
+
 app = FastAPI(
     title="42 DPM API",
-    description="""
-## Overview
-This API powers the 42:Dynamic Pari-mutuel platform.  
-Use it to manage **users**, **markets**, **trading**, and **leaderboards**.
+    version=API_VERSION,
+    summary="Dynamic Pari-mutuel platform API",
+    description=dedent("""
+        ## Overview
+        This API powers the **42: Dynamic Pari-mutuel** platform.
 
-### Subgroups
-- **Users** → manage accounts and balances
-- **Market** → start/reset/resolve market rounds
-- **Trading** → post trades, get holdings
-- **Leaderboard** → fetch points and rankings
-- **Admin** → privileged endpoints
-    """,
-    version="1.0.0",
+        Use it to manage **users**, **markets**, **trading**, and **leaderboards**.
+
+        ### Groups
+        - **Users** → create/load users, balances
+        - **Market** → start/reset/resolve markets, inspect reserves
+        - **Trading** → execute trades, preview metrics_from_qty
+        - **Holdings** → per-user holdings (by ID or username)
+        - **Transactions** → full audit log
+        - **Leaderboard** → points & rankings
+        - **Admin** → privileged operations
+
+        ### Notes
+        - All timestamps are UTC (ISO-8601 without timezone suffix).
+        - Bonding-curve maths mirror the Streamlit frontend (cube-root buy, logistic sell tax).
+    """).strip(),
+    openapi_tags=OPENAPI_TAGS,
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    swagger_ui_parameters={
+        "displayRequestDuration": True,
+        "docExpansion": "list",
+        "tryItOutEnabled": True,
+    },
 )
+
 
 def ensure_bootstrap(db: Session):
     market = db.query(Market).get(1)
@@ -44,7 +95,6 @@ def ensure_bootstrap(db: Session):
         if not db.query(Reserve).filter_by(market_id=1, token=t).first():
             db.add(Reserve(market_id=1, token=t, shares=0, usdc=0.0))
     db.commit()
-
 
 
 @app.on_event("startup")
@@ -67,31 +117,53 @@ def startup():
                 db.add(Reserve(market_id=1, token=t, shares=0, usdc=0.0))
             db.commit()
 
-
-@app.get("/health")
+# ====== Default ======
+@app.get(
+    "/health",
+    response_model=HealthOut,
+    tags=["System"],
+    summary="Health check",
+    description="Lightweight liveness probe. Returns `'ok'` when the API is up."
+)
 def health():
-    return {"status": "ok"}
+    return HealthOut(status="ok")
 
 # ====== User ======
 # Fetch all users
-@app.get("/users", response_model=List[UserOut],
-         tags=["Users"], summary="List all users",
-         description="Fetch all users currently registered in the system.")
+@app.get(
+    "/users",
+    response_model=List[UserOut],
+    tags=["Users"],
+    summary="List all users",
+    description="Fetch all users currently registered in the system."
+)
 def list_users(db: Session = Depends(get_db)):
-    return db.query(User).order_by(User.id.asc()).all()
+    # Either return ORM objects (Pydantic v2 from_attributes)...
+    users = db.query(User).order_by(User.id.asc()).all()
+    return [UserOut(id=u.id, username=u.username, balance=u.balance) for u in users]
+    
 
 # Fetch user by user_id
-@app.get("/users/{user_id}", response_model=UserOut,
-         tags=["Users"], summary="Get user by ID")
+@app.get(
+    "/users/{user_id}",
+    response_model=UserOut,
+    tags=["Users"],
+    summary="Get user by ID",
+    description="Returns the user by ID."
+)
 def get_user(user_id: int, db: Session = Depends(get_db)):
-    user = db.query(User).get(user_id)
+    user = db.get(User, user_id)  # or: db.query(User).get(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="Not Found")
     return UserOut(id=user.id, username=user.username, balance=user.balance)
 
-# Fetch user data by username
-@app.get("/users/by-username/{username}", response_model=UserOut,
-           tags=["Users"], summary="Get user by username")
+# Fetch user data by username (unchanged)
+@app.get(
+    "/users/by-username/{username}",
+    response_model=UserOut,
+    tags=["Users"],
+    summary="Get user by username"
+)
 def get_user_by_username(
     username: str = Path(..., min_length=1),
     db: Session = Depends(get_db),
@@ -104,7 +176,6 @@ def get_user_by_username(
     if not u:
         raise HTTPException(status_code=404, detail="User not found")
     return UserOut(id=u.id, username=u.username, balance=u.balance)
-
 
 # @app.get("/users/with-points", response_model=List[UserWithPointsOut])
 # def list_users_with_points(db: Session = Depends(get_db)):
@@ -151,11 +222,18 @@ def join_or_load_user(payload: UserCreate, db: Session = Depends(get_db)):
 
 
 # ====== Admin ======
+# Start new market
+
 @app.post("/admin/{market_id}/start", response_model=MarketOut,
-          tags=["Admin"], summary="Start market")
-def admin_start(market_id: int,
-                req: StartRequest = Body(default=StartRequest()),
-                db: Session = Depends(get_db)):
+          tags=["Admin"], summary="Start market",
+          description="Starts a market. Requires admin password in body.")
+def admin_start(
+    market_id: int,
+    req: AdminStartRequest = Body(...),
+    db: Session = Depends(get_db),
+):
+    _assert_admin(req.password)
+
     now = _now_iso()
     end = (datetime.utcnow() + timedelta(days=req.duration_days or MARKET_DURATION_DAYS))\
             .replace(microsecond=0).isoformat()
@@ -186,47 +264,75 @@ def admin_start(market_id: int,
     db.refresh(m)
     return m
 
-# Admin reset (path matches your Streamlit code: /admin/reset)
-@app.post("/admin/{market_id}/reset",
-          tags=["Admin"], summary="Reset one market/users")
-def admin_reset(market_id: int, req: ResetRequest, db: Session = Depends(get_db)):
-    now = _now_iso()
+# Admin market reset (makes market active)
+@app.post(
+    "/admin/{market_id}/reset",
+    tags=["Admin"],
+    summary="Reset one market/users",
+    description="Resets a market (and optionally users). Requires admin password in body."
+)
+def admin_reset(
+    market_id: int,
+    req: AdminResetRequest = Body(...),
+    db: Session = Depends(get_db),
+):
+    _assert_admin(req.password)
 
+    now_iso = _now_iso()
+    end_iso = (datetime.utcnow() + timedelta(days=MARKET_DURATION_DAYS)).replace(microsecond=0).isoformat()
+
+    # Upsert + mark ACTIVE
     m = db.get(Market, market_id)
     if not m:
-        m = Market(id=market_id, start_ts=now, end_ts=now, winner_token=None, resolved=1, resolved_ts=now)
+        m = Market(
+            id=market_id,
+            start_ts=now_iso,
+            end_ts=end_iso,
+            winner_token=None,
+            resolved=0,          # <-- active
+            resolved_ts=None
+        )
         db.add(m)
     else:
-        m.start_ts = now
-        m.end_ts = now
+        m.start_ts = now_iso
+        m.end_ts = end_iso
         m.winner_token = None
-        m.resolved = 0
+        m.resolved = 0          # <-- active
         m.resolved_ts = None
 
-    # Reset ONLY this market's reserves
-    db.query(Reserve).filter(Reserve.market_id == market_id).delete()
-
+    # Reset ONLY this market's reserves (avoid UNIQUE constraint)
+    db.query(Reserve).filter(Reserve.market_id == market_id).delete(synchronize_session=False)
+    # Fresh zeroed rows
     for t in TOKENS:
         db.add(Reserve(market_id=market_id, token=t, shares=0, usdc=0.0))
 
     if req.wipe_users:
-        db.query(Holding).delete()
-        db.query(Tx).delete()
-        db.query(User).delete()
+        db.query(Holding).delete(synchronize_session=False)
+        db.query(Tx).delete(synchronize_session=False)
+        db.query(User).delete(synchronize_session=False)
     else:
+        # keep users; reset balances/holdings; clear tx
         for u in db.query(User).all():
             u.balance = STARTING_BALANCE
-        for h in db.query(Holding).all():
-            h.shares = 0
-        db.query(Tx).delete()
+        db.query(Holding).update({Holding.shares: 0})
+        db.query(Tx).delete(synchronize_session=False)
 
     db.commit()
-    return {"status": "ok", "market_active": False}
+    return {"status": "ok", "market_active": True, "start_ts": m.start_ts, "end_ts": m.end_ts}
 
+# Resolve market
 @app.post("/admin/{market_id}/resolve",
-          tags=["Admin"], summary="Resolve a market")
-def admin_resolve(market_id: int, payload: dict, db: Session = Depends(get_db)):
-    winner_token = (payload.get("winner_token") or "").strip()
+          tags=["Admin"], summary="Resolve a market",
+          description="Resolves a market. Requires admin password in body.")
+def admin_resolve(
+    market_id: int,
+    payload: AdminResolveRequest = Body(...),
+    db: Session = Depends(get_db),
+):
+    print(payload)
+    _assert_admin(payload.password)
+
+    winner_token = (payload.winner_token or "").strip().upper()
     if winner_token not in TOKENS:
         raise HTTPException(status_code=400, detail="Invalid winner_token")
 
@@ -286,71 +392,6 @@ def admin_resolve(market_id: int, payload: dict, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "ok", "payout_pool": tot_pool, "winner_token": winner_token}
 
-# # Admin resolve (path matches your Streamlit code: /admin/resolve)
-# @app.post("/admin/resolve",
-#           tags=["Admin"], summary="Resolve on-going market.")
-# def admin_resolve(payload: dict, db: Session = Depends(get_db)):
-#     winner_token = (payload.get("winner_token") or "").strip()
-#     if winner_token not in TOKENS:
-#         raise HTTPException(status_code=400, detail="Invalid winner_token")
-
-#     m = db.get(Market, 1)
-#     if not m:
-#         raise HTTPException(status_code=404, detail="Market not found")
-#     if int(m.resolved or 0) == 1:
-#         raise HTTPException(status_code=400, detail="Market already resolved")
-
-#     # total pool (sum of USDC across both tokens)
-#     tot_pool = float(db.query(func.coalesce(func.sum(Reserve.usdc), 0.0)).scalar() or 0.0)
-
-#     # total winning shares
-#     win_res = db.query(Reserve).filter(Reserve.token == winner_token).first()
-#     win_shares = int(win_res.shares if win_res else 0)
-
-#     payouts = {}
-#     if tot_pool > 0 and win_shares > 0:
-#         # all holders for winner token
-#         for h in db.query(Holding).filter(Holding.token == winner_token, Holding.shares > 0).all():
-#             share = h.shares
-#             payout = tot_pool * (share / win_shares)
-#             payouts[h.user_id] = payouts.get(h.user_id, 0.0) + float(payout)
-
-#     # credit users + log Tx rows
-#     now_iso = datetime.utcnow().isoformat()
-#     for uid, amt in payouts.items():
-#         u = db.get(User, uid)
-#         if not u:
-#             continue
-#         u.balance = float(u.balance or 0.0) + float(amt)
-#         # log a resolve Tx for each paid user
-#         tx = Tx(
-#             ts=now_iso,
-#             user_id=uid,
-#             action="Resolve",
-#             token=winner_token,
-#             qty=0,
-#             buy_price=None, sell_price=None,
-#             buy_delta=None, sell_delta=float(amt),
-#             balance_after=u.balance
-#         )
-#         db.add(tx)
-
-#     # zero holdings & reserves
-#     for h in db.query(Holding).all():
-#         h.shares = 0
-#     for r in db.query(Reserve).all():
-#         r.shares = 0
-#         r.usdc = 0.0
-
-#     # mark market resolved
-#     m.winner_token = winner_token
-#     m.resolved = 1
-#     m.resolved_ts = now_iso
-#     m.end_ts = now_iso
-
-#     db.commit()
-#     return {"status": "ok", "payout_pool": tot_pool, "winner_token": winner_token}
-
 
 # ====== Market ======
 @app.get("/markets",
@@ -382,88 +423,31 @@ def get_market(market_id: int, db: Session = Depends(get_db)):
     )
 
 
-
-
-# @app.get("/market/status")
-# def market_status(db: Session = Depends(get_db)):
-#     m = db.get(Market, 1)
-#     if not m:
-#         return {"exists": False}
-#     ok, why = is_market_active_with_reason(m)
-#     return {
-#         "exists": True,
-#         "start_ts": m.start_ts,
-#         "end_ts": m.end_ts,
-#         "resolved": int(m.resolved or 0),
-#         "winner_token": m.winner_token,
-#         "active": ok,
-#         "why": why,
-#         "now": _now_iso(),
-#     }
-
-@app.post("/market/{market_id}/reset")
-def reset_market(
-    market_id: int = Path(..., ge=1, description="Market ID to reset"),
-    req: ResetRequest = Body(...),
+# ====== User Holdings ======
+# Fetch user holdings via user_id
+@app.get(
+    "/holdings/{user_id}",
+    response_model=List[HoldingOut],
+    tags=["Holdings"],
+    summary="Get holdings by user ID",
+    description="Returns all token holdings for the specified numeric user ID."
+)
+def get_holdings(
+    user_id: Annotated[int, Path(..., ge=1, description="Numeric user ID", example=1)],
     db: Session = Depends(get_db),
 ):
-    now = datetime.utcnow().replace(microsecond=0)
-    end = now + timedelta(days=MARKET_DURATION_DAYS)
-
-    # upsert the market
-    m = db.get(Market, market_id)
-    if not m:
-        m = Market(
-            id=market_id,
-            start_ts=now.isoformat(),
-            end_ts=end.isoformat(),
-            winner_token=None,
-            resolved=0,
-            resolved_ts=None,
-        )
-        db.add(m)
-    else:
-        m.start_ts = now.isoformat()
-        m.end_ts = end.isoformat()
-        m.winner_token = None
-        m.resolved = 0
-        m.resolved_ts = None
-
-    # reset reserves for THIS market only
-    db.query(Reserve).filter(Reserve.market_id == market_id).delete(synchronize_session=False)
-    for t in TOKENS:
-        db.add(Reserve(market_id=market_id, token=t, shares=0, usdc=0.0))
-
-    if req.wipe_users:
-        # global wipe (your models aren't market-scoped)
-        db.query(Holding).delete(synchronize_session=False)
-        db.query(Tx).delete(synchronize_session=False)
-        db.query(User).delete(synchronize_session=False)
-    else:
-        # keep users; reset balances/holdings; clear tx (global, given current schema)
-        for u in db.query(User).all():
-            u.balance = STARTING_BALANCE
-        for h in db.query(Holding).all():
-            h.shares = 0
-        db.query(Tx).delete(synchronize_session=False)
-
-    db.commit()
-    return {"status": "ok", "market_id": market_id}
-
-# --- Reserves / Holdings / Transactions ---
-@app.get("/reserves", response_model=List[ReserveOut])
-def get_reserves(db: Session = Depends(get_db)):
-    return db.query(Reserve).all()
-
-# Fetch user holdings via user_id
-@app.get("/holdings/{user_id}", response_model=List[HoldingOut])
-def get_holdings(user_id: int, db: Session = Depends(get_db)):
-    return db.query(Holding).filter(Holding.user_id==user_id).all()
+    return db.query(Holding).filter(Holding.user_id == user_id).all()
 
 # Fetch user holdings via username
-@app.get("/holdings/by-username/{username}", response_model=List[HoldingOut])
+@app.get(
+    "/holdings/by-username/{username}",
+    response_model=List[HoldingOut],
+    tags=["Holdings"],
+    summary="Get holdings by username",
+    description="Case-insensitive lookup. Returns 404 if the user does not exist."
+)
 def get_holdings_by_username(
-    username: str = Path(..., min_length=1),
+    username: Annotated[str, Path(..., min_length=1, description="Username (case-insensitive)", example="alice")],
     db: Session = Depends(get_db),
 ):
     u = (
@@ -475,9 +459,19 @@ def get_holdings_by_username(
         raise HTTPException(status_code=404, detail="User not found")
     return db.query(Holding).filter(Holding.user_id == u.id).all()
 
-@app.get("/tx", response_model=List[TxOut])
+
+# ====== Transaction Logs ======
+@app.get(
+    "/tx",
+    response_model=List[TxOut],
+    tags=["Transactions"],
+    summary="List all transaction logs",
+    description="Returns every transaction in the system ordered by timestamp (ascending). "
+                "Includes buys, sells, resolves, deltas, and post-trade balances."
+)
 def get_tx(db: Session = Depends(get_db)):
     return db.query(Tx).order_by(Tx.ts.asc()).all()
+
 
 # ====== Trading ======
 # Post a trade action for a user
@@ -515,6 +509,47 @@ def leaderboard(db: Session = Depends(get_db)):
 #     now = datetime.utcnow().isoformat()
 #     return [{"ts": now, "user": r["user"], "total_points": r["total_points"]} for r in rows]
 
+
+# ---- Preview Endpoint ----
+@app.post("/preview/{market_id}/{token}",
+          response_model=PreviewResponse,
+          tags=["Trading"],
+          summary="Preview buy/sell metrics given current reserve and a quantity (no state change)")
+def preview_metrics(
+    market_id: Annotated[int, Path(..., ge=1, description="Market ID", example=1)],
+    token: Annotated[str, Path(..., description=f"Outcome token (e.g. 'YES'). Valid options: {TOKENS}", example="YES")],
+    req: PreviewRequest,
+    db: Session = Depends(get_db),
+):
+    token = token.strip().upper()
+    if token not in TOKENS:
+        raise HTTPException(status_code=400, detail="Invalid token")
+
+    r = (
+        db.query(Reserve)
+        .filter(Reserve.market_id == market_id, Reserve.token == token)
+        .first()
+    )
+    if not r:
+        raise HTTPException(status_code=404, detail="Reserve not found for this market/token")
+
+    reserve = int(r.shares or 0)
+    q = int(req.quantity or 0)
+
+    buy_price, sell_price, buy_amt, sell_amt, tax_used = metrics_from_qty(reserve, q)
+
+    return PreviewResponse(
+        market_id=market_id,
+        token=token,
+        reserve=reserve,
+        quantity=q,
+        new_reserve=reserve + q,
+        buy_price=buy_price,
+        sell_price_marginal_net=sell_price,
+        buy_amt_delta=buy_amt,
+        sell_amt_delta=sell_amt,
+        sell_tax_rate_used=tax_used,
+    )
 
 # --- Middleware ---
 app.add_middleware(

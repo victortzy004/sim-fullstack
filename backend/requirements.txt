@@ -6,3 +6,4 @@ alembic
 pydantic
 python-dotenv
 psycopg2-binary>=2.9
+typing-extensions

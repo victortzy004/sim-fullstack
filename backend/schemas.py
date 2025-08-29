@@ -1,5 +1,8 @@
-from pydantic import BaseModel, ConfigDict
-from typing import Optional, List, Dict
+from pydantic import BaseModel, ConfigDict, Field
+from typing import Optional, List, Literal
+
+class HealthOut(BaseModel):
+    status: Literal["ok"]
 
 class StartRequest(BaseModel):
     duration_days: Optional[int] = None     # default to MARKET_DURATION_DAYS if None
@@ -26,6 +29,19 @@ class ResetRequest(BaseModel):
 class StartRequest(BaseModel):
     duration_days: Optional[int] = None
     reset_reserves: bool = False
+
+# Extends your StartRequest (adds 'password')
+class AdminStartRequest(StartRequest):
+    password: str = Field(..., min_length=1, description="Admin password")
+
+# Extends your ResetRequest (adds 'password')
+class AdminResetRequest(ResetRequest):
+    password: str = Field(..., min_length=1, description="Admin password")
+
+# Resolve needs a structured payload
+class AdminResolveRequest(BaseModel):
+    password: str = Field(..., min_length=1, description="Admin password")
+    winner_token: str = Field(..., description="Winning outcome token")
 
 class ReserveOut(BaseModel):
     market_id: int
@@ -73,9 +89,6 @@ class TradeIn(BaseModel):
     amount: float  # qty (int-ish) if mode=qty, otherwise USDC
     side: str  # "buy" or "sell"
 
-class ResetRequest(BaseModel):
-    wipe_users: bool = False
-
 class LeaderboardRow(BaseModel):
     user: str
     portfolio_value: float
@@ -88,3 +101,20 @@ class PointsTimelineRow(BaseModel):
     ts: str
     user: str
     total_points: float
+
+
+# ---- Preview Schemas ----
+class PreviewRequest(BaseModel):
+    quantity: int
+
+class PreviewResponse(BaseModel):
+    market_id: int
+    token: str
+    reserve: int
+    quantity: int
+    new_reserve: int
+    buy_price: float                 # price after adding quantity
+    sell_price_marginal_net: float   # 1-share marginal sell price after tax at current reserve
+    buy_amt_delta: float             # USDC needed to buy quantity
+    sell_amt_delta: float            # USDC received to sell quantity after tax
+    sell_tax_rate_used: float        # 0..1 (for the provided quantity)

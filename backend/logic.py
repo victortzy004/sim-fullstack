@@ -32,32 +32,107 @@ def buy_curve(x: float) -> float:
     return (x**(1/3)/1000) + 0.1
     # return x**(1/4) + x / 400
 
-def sell_curve(x: float) -> float:
-    t = (x - 500000.0) / 1_000_000.0
-    p = 1.0 / (4.0 * (0.8 + math.exp(-t))) - 0.05
-    return max(p,0.0)
-    # return ((x - 500)/40) / ((8 + ((x - 500)/80)**2)**0.5) + (x - 500)/300 + 3.6
+# def sell_curve(x: float) -> float:
+#     t = (x - 500000.0) / 1_000_000.0
+#     p = 1.0 / (4.0 * (0.8 + math.exp(-t))) - 0.05
+#     return max(p,0.0)
+#     # return ((x - 500)/40) / ((8 + ((x - 500)/80)**2)**0.5) + (x - 500)/300 + 3.6
 
 def buy_delta(x: float) -> float:
     return (3.0/4000.0) * (x**(4.0/3.0)) + x/10.0
     # return (640 * x**(5/4) + x**2) / 800
 
-def sell_delta(x: float) -> float:
+# def sell_delta(x: float) -> float:
+#     """
+#     ∫ y dx = 312500 * ln(1 + 0.8 * e^{(x-500000)/1e6}) - 0.05*x + C, C=0
+#     """
+#     t = (x - 500000.0) / 1_000_000.0
+#     # use log1p for better numerical stability
+#     return 312_500.0 * math.log1p(0.8 * math.exp(t)) - 0.05 * x
+#     # return 1.93333 * x + 0.00166667 * x**2 + 2 * math.sqrt(301200 - 1000 * x + x**2)
+
+
+# ===== Sale Tax Helpers (new) =====
+def _clamp01(x: float) -> float:
+    return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+
+def sale_tax_rate(q: int, C: int) -> float:
     """
-    ∫ y dx = 312500 * ln(1 + 0.8 * e^{(x-500000)/1e6}) - 0.05*x + C, C=0
+    q: number of shares sold in *this order*
+    C: total circulating shares (reserve) before the sale
+
+    Tax = min(1, (1.15 - 1.3/(1 + e^(4*(q/C) - 2))))
+
+    We clamp to [0,1] to keep it sane even if the scaling makes it big.
     """
-    t = (x - 500000.0) / 1_000_000.0
-    # use log1p for better numerical stability
-    return 312_500.0 * math.log1p(0.8 * math.exp(t)) - 0.05 * x
-    # return 1.93333 * x + 0.00166667 * x**2 + 2 * math.sqrt(301200 - 1000 * x + x**2)
+    if C <= 0 or q <= 0:
+        return 0.0
+    X = q / float(C)  # fraction of supply this order is selling
+    base = 1.15 - 1.3 / (1.0 + math.e ** (4.0 * X - 2.0))
+    # scale = C * math.e ** ((C / 100000.0 - 1.0) / 10000.0)
+    # tax = base * scale
+    tax = base
+    return _clamp01(tax)
+
+def sell_proceeds_net(reserve: int, q: int) -> float:
+    """Net USDC user receives after the order-level sale tax."""
+    if q <= 0 or reserve <= 0:
+        return 0.0
+    q = min(q, reserve)
+    gross = buy_delta(reserve) - buy_delta(reserve - q)
+    tax = sale_tax_rate(q, reserve)
+    net = gross * (1.0 - tax)
+    return max(0.0, float(net))
+
+def current_marginal_sell_price_after_tax(reserve: int) -> float:
+    """
+    A single-share 'instant' effective price (for UI display).
+    Uses q=1 to estimate marginal price after tax.
+    """
+    if reserve <= 0:
+        return 0.0
+    gross1 = buy_delta(reserve) - buy_delta(reserve - 1)
+    tax1 = sale_tax_rate(1, reserve)
+    return max(0.0, float(gross1 * (1.0 - tax1)))
+
+def sell_gross_from_bonding(reserve: int, q: int) -> float:
+    """Bonding-curve gross proceeds (no tax), using your buy integral as the primitive."""
+    if q <= 0 or reserve <= 0:
+        return 0.0
+    q = min(q, reserve)
+    return float(buy_delta(reserve) - buy_delta(reserve - q))
+
+# vectorized tax (for charts)
+# _sale_tax_rate_vec = np.vectorize(sale_tax_rate, otypes=[float])
 
 def metrics_from_qty(x: int, q: int):
+    """
+    Returns (in order):
+      buy_price         = buy spot after adding q
+      sell_price        = marginal 1-share sell price after tax (display only)
+      buy_amt_delta     = USDC to buy q
+      sell_amt_delta    = USDC received to sell q after tax
+      sell_tax_rate_used= order-level tax applied for selling q out of reserve x (0..1)
+    """
+    q = int(max(0, q))
     new_x = x + q
+
     buy_price = buy_curve(new_x)
-    sell_price = sell_curve(x)
+    sell_price = current_marginal_sell_price_after_tax(x)
+
     buy_amt_delta = buy_delta(new_x) - buy_delta(x)
-    sell_amt_delta = sell_delta(x) - sell_delta(x - q) if x - q >= 0 else 0.0
-    return buy_price, sell_price, buy_amt_delta, sell_amt_delta
+
+    # Clamp sell qty to circulating reserve for proceeds + tax computation
+    q_eff = min(q, x if x > 0 else 0)
+    if q_eff > 0 and x > 0:
+        tax_used = sale_tax_rate(q_eff, x)
+        sell_amt_delta = sell_proceeds_net(x, q_eff)
+    else:
+        tax_used = 0.0
+        sell_amt_delta = 0.0
+
+    return buy_price, sell_price, buy_amt_delta, sell_amt_delta, float(tax_used)
+
 
 def qty_from_buy_usdc(reserve: int, usd: float) -> int:
     if usd <= 0:
@@ -79,22 +154,28 @@ def qty_from_buy_usdc(reserve: int, usd: float) -> int:
     return int(q)
 
 def qty_from_sell_usdc(reserve: int, usd: float) -> int:
-    if usd <= 0:
+    if usd <= 0.0 or reserve <= 0:
         return 0
-    # initial guess: linear approx using current sell price
-    q = usd / max(sell_curve(reserve), 1e-9)
-    q = max(0.0, min(q, float(reserve)))
 
-    for _ in range(12):
-        f  = (sell_delta(reserve) - sell_delta(reserve - q)) - usd
-        fp = max(sell_curve(reserve - q), 1e-9)  # df/dq = price at (reserve - q)
-        step = f / fp
-        q -= step
-        if q < 0.0: q = 0.0
-        if q > reserve: q = float(reserve)
-        if abs(step) < 1e-6:
-            break
-    return int(q)
+    # initial guess using current *net* marginal price
+    p0_net = max(current_marginal_sell_price_after_tax(reserve), 1e-12)
+    q_guess = min(reserve, usd / p0_net)
+
+    # robust binary search on net proceeds
+    lo, hi = 0, int(reserve)
+    # tighten bounds around the guess to speed up
+    lo = max(0, int(q_guess * 0.25))
+    hi = min(int(reserve), max(lo, int(q_guess * 1.75)))
+
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        net = sell_proceeds_net(reserve, mid)
+        if net <= usd:
+            lo = mid
+        else:
+            hi = mid - 1
+    return int(lo)
+
 
 def ensure_seed(db: Session):
     # market
@@ -201,7 +282,7 @@ def do_trade(db: Session, user_id: int, token: str, side: str, mode: str, amount
 
     if side == "buy":
         # price & deltas based on current reserve
-        buy_price, _, buy_amt_delta, _ = metrics_from_qty(reserve, qty)
+        buy_price, _, buy_amt_delta, _, _ = metrics_from_qty(reserve, qty)
         if user.balance < buy_amt_delta:
             raise ValueError("Insufficient balance.")
 
@@ -226,7 +307,7 @@ def do_trade(db: Session, user_id: int, token: str, side: str, mode: str, amount
             raise ValueError("Insufficient shares to sell.")
 
         # sell metrics use current reserve (before decrement)
-        _, sell_price, _, sell_amt_delta = metrics_from_qty(reserve, qty)
+        _, sell_price, _, sell_amt_delta, _ = metrics_from_qty(reserve, qty)
 
         # Optionally guard: pool must have enough USDC (should be true by construction)
         if float(res.usdc) < float(sell_amt_delta) - 1e-9:
@@ -306,3 +387,4 @@ def compute_user_points(db: Session):
             "total_points": vol_points[uid] + pnl_points
         })
     return rows
+
