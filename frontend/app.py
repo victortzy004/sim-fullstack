@@ -1251,7 +1251,7 @@ for i, token in enumerate(TOKENS):
         with sub_cols[0]:
             st.metric(f"Total Shares", reserve)
         with sub_cols[1]:
-            st.metric(f"Price", price)
+            st.metric(f"Price", f"${price}")
         with sub_cols[2]:
             st.metric(f"MCAP", format_usdc_compact(mcap))
 
@@ -1452,7 +1452,7 @@ for token, token_tab in zip(TOKENS, token_tabs):
         # One radio to switch sub-graphs (no nested tabs)
         view = st.radio(
             "View",
-            ["Buy Curve", "Sale Tax", "Effective Sell (Net)"],
+            ["Buy Curve", "Sell Spread", "Effective Sell (Net)"],
             horizontal=True,
             key=f"view_{token}",
         )
@@ -1520,9 +1520,9 @@ for token, token_tab in zip(TOKENS, token_tabs):
             )
             st.plotly_chart(fig_curve, use_container_width=True, key=f"chart_curve_{token}")
 
-        elif view == "Sale Tax":
+        elif view == "Sell Spread":
             if reserve <= 0:
-                st.info("No circulating shares yet — tax curve will show once there is supply.")
+                st.info("No circulating shares yet — Sell spread curve will show once there is supply.")
             else:
                 steps = 200
                 X = np.linspace(0.0, 1.0, steps + 1)
@@ -1533,7 +1533,7 @@ for token, token_tab in zip(TOKENS, token_tabs):
 
                 fig_tax = go.Figure()
                 fig_tax.add_trace(go.Scattergl(
-                    x=X * 100.0, y=tax_y, mode='lines', name='Sale Tax Rate'
+                    x=X * 100.0, y=tax_y, mode='lines', name='Spread Rate'
                 ))
                 fig_tax.update_layout(
                     title='Sale Tax vs % of Supply Sold (per order)',
