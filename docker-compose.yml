@@ -31,7 +31,7 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg2://app:supersecret@db:5432/appdb
       # Allow Streamlit to call the API from its origin:
-      CORS_ORIGINS: "http://localhost:8505,http://frontend:8505"
+      CORS_ORIGINS: https://concept.alkimiya.io,http://concept.alkimiya.io,http://localhost:8501,http://localhost:8505
 
   frontend:
     build:
