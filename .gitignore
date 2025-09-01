@@ -1,7 +1,19 @@
 __pycache__/
 *.pyc
 *.pyo
-.env
 .alembic/
 pgdata/
 app.db
+
+# .env variants
+.env
+.env.*
+*.env
+**/.env
+**/.env.*
+**/*.env
+
+# Keep example env files
+!.env.example
+!**/.env.example
+!*.env.example

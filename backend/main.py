@@ -16,9 +16,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 
 
-# Option A: auto-find .env by walking up from this file
+# Load .env file for config
 load_dotenv(find_dotenv(), override=False)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+
 if not ADMIN_PASSWORD:
     # raise or log clearly so you catch it early
     print("WARNING: ADMIN_PASSWORD is not set; admin endpoints will fail")
@@ -84,6 +85,7 @@ app = FastAPI(
         "tryItOutEnabled": True,
     },
 )
+
 
 
 def ensure_bootstrap(db: Session):

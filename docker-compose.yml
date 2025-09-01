@@ -18,6 +18,24 @@ services:
       timeout: 5s
       retries: 10
 
+  sim_db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_SIM_USER:-app_sim}
+      POSTGRES_PASSWORD: ${POSTGRES_SIM_PASSWORD:-simsecret}
+      POSTGRES_DB: ${POSTGRES_SIM_DB:-app_sim_db}
+    volumes:
+      - dbdata_sim:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_SIM_USER:-app_sim} -d ${POSTGRES_SIM_DB:-app_sim_db}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   api:
     build: .
     env_file:
@@ -36,13 +54,33 @@ services:
       uvicorn backend.main:app
       --host 0.0.0.0 --port 8000
       --proxy-headers --forwarded-allow-ips='*'
-      --root-path /api
+    #  --root-path /api
+
+  api_sim:
+    build: .
+    env_file:
+      - backend/.env
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg2://app_sim:simsecret@sim_db:5432/app_sim_db
+      # Allow Streamlit to call the API from its origin:
+      CORS_ORIGINS: https://concept.alkimiya.io,http://concept.alkimiya.io,http://localhost:8501,http://localhost:8505,https://fortytwo-sim.streamlit.app/
+    command: >
+      uvicorn backend.main:app
+      --host 0.0.0.0 --port 8000
+      --proxy-headers --forwarded-allow-ips='*'
+    # --root-path /api_sim
 
   frontend:
     build:
       context: ./frontend
     environment:
-      API_BASE_URL: "http://api:8000" # <— use service name, not localhost
+      API_BASE_URL: "http://api_sim:8001" # <— use api_sim service
     command: >
       sh -c "python -m streamlit run app.py
             --server.port=8505
@@ -51,8 +89,9 @@ services:
     ports:
       - "8505:8501"
     depends_on:
-      - api
+      - api_sim
     restart: unless-stopped
 
 volumes:
   dbdata:
+  dbdata_sim:
