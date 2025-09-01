@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 
 
-# Load .env file for config
+# Load .env file for root path
 load_dotenv(find_dotenv(), override=False)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 

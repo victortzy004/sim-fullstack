@@ -14,18 +14,18 @@ from pathlib import Path
 import os
 from dotenv import load_dotenv
 
-ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(ROOT / ".env")   # make variables visible to os.getenv
+# ROOT = Path(__file__).resolve().parents[1]
+# load_dotenv(ROOT / ".env")   # make variables visible to os.getenv
+BASE = "http://concept.alkimiya.io/api"
 
-st.caption(f"API_BASE_URL: {os.getenv('API_BASE_URL')}")
+st.caption(f"API_BASE_URL: {BASE}")
 
 # ===========================================================
 # Constants
 DEFAULT_DECIMAL_PRECISION = 2
 BASE_EPSILON = 1e-4
 MARKET_DURATION_DAYS = 5
-END_TS = "2025-08-31 00:00"
-DB_PATH = "app.db"
+END_TS = "2025-09-07 00:00"
 MAX_SHARES = 5000000 #10M
 STARTING_BALANCE = 10000.0
 

@@ -54,7 +54,8 @@ services:
       uvicorn backend.main:app
       --host 0.0.0.0 --port 8000
       --proxy-headers --forwarded-allow-ips='*'
-    #  --root-path /api
+      --root-path /api
+    # 'root-path' required for production deployment
 
   api_sim:
     build: .
@@ -74,7 +75,8 @@ services:
       uvicorn backend.main:app
       --host 0.0.0.0 --port 8000
       --proxy-headers --forwarded-allow-ips='*'
-    # --root-path /api_sim
+      --root-path /api
+    # 'root-path' required for production deployment
 
   frontend:
     build:

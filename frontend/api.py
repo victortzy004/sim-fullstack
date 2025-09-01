@@ -3,7 +3,8 @@ import os
 import requests
 from typing import Any, Dict, Optional
 
-BASE = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+# BASE = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+BASE = "http://concept.alkimiya.io/api"
 
 
 class APIError(RuntimeError):
