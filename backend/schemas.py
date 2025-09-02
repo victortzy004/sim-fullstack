@@ -72,6 +72,7 @@ class TxOut(BaseModel):
     id: int
     ts: str
     user_id: int
+    user_name: str
     action: str
     token: str
     qty: int

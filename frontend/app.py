@@ -7,6 +7,7 @@ import math
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from typing import Tuple, Dict, List
 
 from api import api_get, api_post, APIError
@@ -19,6 +20,8 @@ from dotenv import load_dotenv
 BASE = "http://concept.alkimiya.io/api"
 
 st.caption(f"API_BASE_URL: {BASE}")
+
+
 
 # ===========================================================
 # Constants
@@ -60,6 +63,40 @@ PHASE_MULTIPLIERS = {
     "late": LATE_MULTIPLIER,
 }
 # ===========================================================
+
+
+
+
+@st.cache_resource
+def _session():
+    s = requests.Session()             # keep-alive
+    s.headers["Accept-Encoding"] = "gzip, deflate"
+    return s
+
+# If you can, update api.py to use the session above; otherwise:
+def _get(path, timeout=5):
+    return _session().get(f"{BASE.rstrip('/')}{path}", timeout=timeout).json()
+
+@st.cache_data(ttl=5)
+def fetch_snapshot(market_id: int, user_id: int | None):
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        fut_market   = ex.submit(_get, f"/market/{market_id}")
+        fut_tx       = ex.submit(_get, "/tx")
+        fut_users    = ex.submit(_get, "/users")
+        fut_holdings = ex.submit(_get, f"/holdings/{user_id}") if user_id else []
+    return {
+        "market": fut_market.result(),
+        "tx": fut_tx.result(),
+        "users": fut_users.result(),
+        "holdings": fut_holdings.result() if fut_holdings else []
+    }
+
+# Use it ONCE
+snap = fetch_snapshot(MARKET_ID, st.session_state.get("user_id"))
+m = snap["market"]
+tx_raw = pd.DataFrame(snap["tx"])
+users_df_all = pd.DataFrame(snap["users"])
+user_holdings_list = snap["holdings"]
 
 def interpret_market(srv: dict):
     """
@@ -715,6 +752,7 @@ ensure_user_session()
 if "user_id" in st.session_state:
     try:
         u = api_get(f"/users/{st.session_state.user_id}")
+        print('u---->', u)
         st.session_state.balance = float(u["balance"])
     except APIError as e:
         st.warning(f"Could not refresh balance: {e}")
@@ -1575,67 +1613,6 @@ for token, token_tab in zip(TOKENS, token_tabs):
                 st.plotly_chart(fig_eff, use_container_width=True, key=f"effective_sell_{token}")
 
 
-# for token, tab in zip(TOKENS, tabs):
-#     with tab:
-#         reserve = int(latest_reserves.get(token, 0))
-#         buy_price_now = buy_curve(reserve)
-#         sell_price_now = sell_curve(reserve)
-
-#         xs, buy_vals, sell_vals = get_curve_series(int(MAX_SHARES), reserve)
-
-#         fig = go.Figure()
-#         fig.add_trace(go.Scattergl(
-#             x=xs, y=buy_vals, mode='lines', name='Buy Curve'
-#         ))
-#         fig.add_trace(go.Scattergl(
-#             x=xs, y=sell_vals, mode='lines', name='Sell Curve'
-#         ))
-
-#         # current points
-#         fig.add_trace(go.Scatter(
-#             x=[reserve], y=[buy_price_now], mode='markers+text',
-#             name=f'{token} Buy @ reserve',
-#             text=[f"Shares: {reserve}<br>Price: {buy_price_now:.2f}"],
-#             textposition="top right",
-#             marker=dict(size=10),
-#             showlegend=False
-#         ))
-#         fig.add_trace(go.Scatter(
-#             x=[reserve], y=[sell_price_now], mode='markers+text',
-#             name=f'{token} Sell @ reserve',
-#             text=[f"Shares: {reserve}<br>Price: {sell_price_now:.2f}"],
-#             textposition="bottom right",
-#             marker=dict(size=10),
-#             showlegend=False
-#         ))
-
-#         # helper lines
-#         y_floor = float(min(buy_vals.min(), sell_vals.min(), buy_price_now, sell_price_now, 0.0))
-#         fig.add_trace(go.Scatter(x=[reserve, reserve], y=[y_floor, buy_price_now],
-#                                  mode='lines', line=dict(dash='dot'), showlegend=False))
-#         fig.add_trace(go.Scatter(x=[xs.min(), reserve], y=[buy_price_now, buy_price_now],
-#                                  mode='lines', line=dict(dash='dot'), showlegend=False))
-#         fig.add_trace(go.Scatter(x=[reserve, reserve], y=[y_floor, sell_price_now],
-#                                  mode='lines', line=dict(dash='dot'), showlegend=False))
-#         fig.add_trace(go.Scatter(x=[xs.min(), reserve], y=[sell_price_now, sell_price_now],
-#                                  mode='lines', line=dict(dash='dot'), showlegend=False))
-
-#         fig.update_layout(
-#             title=f"{token} — Price vs Shares",
-#             xaxis_title="Shares",
-#             yaxis_title="Price",
-#             hovermode="x unified",
-#         )
-
-#         # header metrics
-#         c1, c2, c3 = st.columns(3)
-#         c1.metric("Reserve (shares)", f"{reserve:,}")
-#         c2.metric("Pool USDC", f"{latest_usdc.get(token, 0.0):,.2f}")
-#         c3.metric("Buy / Sell now", f"{buy_price_now:.2f} / {sell_price_now:.2f}")
-
-#         st.plotly_chart(fig, use_container_width=True, key=f"curve_{market_id}_{token}")
-
-# st.divider()
  # ===========================================================
 
 # Always fetch tx + users once
@@ -1908,86 +1885,3 @@ if not txp.empty:
                 use_container_width=True
             )
 
-
-#     # === Leaderboard (Correct "now" snapshot) ===
-# # Use current balances from /users, current holdings reconstructed from /tx,
-# # and current prices from the latest reserves. This reflects:
-# # PV_now = balance_now + sum(holdings_now[token] * price_now[token]).
-
-# # 1) Load users (id, username, balance)
-# users_df_all = load_users_df()
-# if users_df_all.empty:
-#     st.info("No users found (or /users returned an unexpected shape).")
-
-# else:
-#     # 2) Latest reserves and prices (use your APP pricing, not viz)
-#     reserves_latest = api_get(f"/market/{MARKET_ID}").get('reserves')
-#     res_map_shares = {r["token"]: int(r["shares"]) for r in reserves_latest}
-#     price_now = {t: float(buy_curve(res_map_shares.get(t, 0))) for t in TOKENS}
-
-#     # 3) Rebuild CURRENT holdings by replaying tx and resetting at every Resolv
-
-#     # tx was already normalized earlier (has Time, Action, Outcome, Quantity, user_id)
-#     holdings_now = rebuild_holdings_now(tx, users_df_all)
-
-#     # 4) Build leaderboard rows
-#     lb_rows = []
-#     for _, u in users_df_all.iterrows():
-#         uid = int(u["id"])
-#         bal_now = float(u["balance"])  # current cash from API
-#         shares_val = sum(holdings_now.get(uid, {}).get(t, 0) * price_now[t] for t in TOKENS)
-#         pv_now = bal_now + shares_val
-#         pnl_now = pv_now - STARTING_BALANCE
-#         lb_rows.append({"User": u["username"], "PortfolioValue": pv_now, "PnL": pnl_now})
-
-#     latest = pd.DataFrame(lb_rows)
-
-#     # Exclude admin if desired
-#     if not latest.empty:
-#         if "User" in latest.columns:
-#             latest = latest[~latest["User"].astype(str).str.lower().eq("admin")]
-#         elif "username" in latest.columns:
-#             # if the frame uses 'username', align naming and filter
-#             latest = latest.rename(columns={"username": "User"})
-#             latest = latest[~latest["User"].astype(str).str.lower().eq("admin")]
-
-#     # 5) Points: volume + PnL points (only positive PnL)
-#     points_vol = compute_user_points(tx, users_df_all[["id","username"]].rename(columns={"username": "username"}))
-
-#     # When latest is empty, still keep the expected columns so merges work
-#     if latest.empty and "User" not in latest.columns:
-#         latest["User"] = pd.Series(dtype="object")
-#     if latest.empty and "PnL" not in latest.columns:
-#         latest["PnL"] = pd.Series(dtype="float")
-        
-#     pnl_points = latest[["User", "PnL"]].copy()
-#     pnl_points["PnLPoints"] = pnl_points["PnL"].clip(lower=0.0) * PNL_POINTS_PER_USD
-
-#     # 6) Merge and present
-#     pts = points_vol.merge(pnl_points[["User","PnLPoints"]], on="User", how="outer").fillna(0.0)
-#     latest = latest.merge(pts[["User", "PnLPoints", "VolumePoints"]], on="User", how="left").fillna(0.0)
-#     latest["TotalPoints"] = latest["VolumePoints"] + latest["PnLPoints"]
-
-#     # Sort by PnL (or TotalPoints, your call)
-#     latest = latest.sort_values("PnL", ascending=False, kind="mergesort")
-
-#     st.subheader("🏆 Leaderboard (Portfolio, PnL & Points)")
-#     if latest.empty:
-#         st.info("No eligible users to display yet.")
-#     else:
-#         top_cols = st.columns(min(3, len(latest)))
-#         for i, (_, row) in enumerate(latest.head(3).iterrows()):
-#             delta_val = f"${row['PnL']:,.2f}" if row['PnL'] >= 0 else f"-${abs(row['PnL']):,.2f}"
-#             with top_cols[i]:
-#                 st.metric(
-#                     label=f"#{i+1} {row['User']}",
-#                     value=f"${row['PortfolioValue']:,.2f}",
-#                     delta=delta_val,
-#                     border=True
-#                 )
-#                 st.caption(f"Points: {row['TotalPoints']:,.0f}")
-
-#         st.dataframe(
-#             latest[["User", "PortfolioValue", "PnL", "VolumePoints", "PnLPoints", "TotalPoints"]],
-#             use_container_width=True
-#         )

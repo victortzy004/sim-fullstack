@@ -59,6 +59,7 @@ class Tx(Base):
     id = Column(Integer, primary_key=True)
     ts = Column(String, nullable=False)
     user_id = Column(Integer, nullable=False)
+    user_name = Column(String, nullable=False)
     action = Column(String, nullable=False)
     token = Column(String, nullable=False)
     qty = Column(Integer, nullable=False)

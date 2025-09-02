@@ -279,6 +279,8 @@ def do_trade(db: Session, user_id: int, token: str, side: str, mode: str, amount
         raise ValueError("Quantity computed as 0.")
 
     now_iso = datetime.utcnow().replace(microsecond=0).isoformat()
+    print(user.username)
+    username = user.username
 
     if side == "buy":
         # price & deltas based on current reserve
@@ -294,7 +296,7 @@ def do_trade(db: Session, user_id: int, token: str, side: str, mode: str, amount
 
         # tx log
         db.add(Tx(
-            ts=now_iso, user_id=user_id, action="Buy", token=token, qty=qty,
+            ts=now_iso, user_id=user_id, user_name=username, action="Buy", token=token, qty=qty,
             buy_price=float(buy_price), buy_delta=float(buy_amt_delta),
             sell_price=None, sell_delta=None,
             balance_after=float(user.balance),
@@ -321,7 +323,7 @@ def do_trade(db: Session, user_id: int, token: str, side: str, mode: str, amount
 
         # tx log
         db.add(Tx(
-            ts=now_iso, user_id=user_id, action="Sell", token=token, qty=qty,
+            ts=now_iso, user_id=user_id, user_name=username, action="Sell", token=token, qty=qty,
             buy_price=None, buy_delta=None,
             sell_price=float(sell_price), sell_delta=float(sell_amt_delta),
             balance_after=float(user.balance),

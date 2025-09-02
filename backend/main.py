@@ -225,7 +225,6 @@ def join_or_load_user(payload: UserCreate, db: Session = Depends(get_db)):
 
 # ====== Admin ======
 # Start new market
-
 @app.post("/admin/{market_id}/start", response_model=MarketOut,
           tags=["Admin"], summary="Start market",
           description="Starts a market. Requires admin password in body.")
