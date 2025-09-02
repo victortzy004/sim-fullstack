@@ -9,6 +9,8 @@ import plotly.graph_objects as go
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from typing import Tuple, Dict, List
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from api import api_get, api_post, APIError
 from pathlib import Path
@@ -17,7 +19,8 @@ from dotenv import load_dotenv
 
 # ROOT = Path(__file__).resolve().parents[1]
 # load_dotenv(ROOT / ".env")   # make variables visible to os.getenv
-BASE = "http://concept.alkimiya.io/api"
+BASE = "http://concept.alkimiya.io/simpi"
+# BASE = "http://localhost:8000/"
 
 st.caption(f"API_BASE_URL: {BASE}")
 
@@ -65,38 +68,59 @@ PHASE_MULTIPLIERS = {
 # ===========================================================
 
 
-
-
 @st.cache_resource
-def _session():
-    s = requests.Session()             # keep-alive
-    s.headers["Accept-Encoding"] = "gzip, deflate"
+def http_session() -> requests.Session:
+    s = requests.Session()
+    retries = Retry(total=2, backoff_factor=0.1, status_forcelist=[502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=8, pool_maxsize=8)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.headers.update({"Accept": "application/json"})
     return s
 
-# If you can, update api.py to use the session above; otherwise:
-def _get(path, timeout=5):
-    return _session().get(f"{BASE.rstrip('/')}{path}", timeout=timeout).json()
+def _get(path: str, timeout: float = 5.0, session: requests.Session | None = None):
+    s = session or http_session()    # <- no st.* in this function
+    url = f"{BASE.rstrip('/')}{path}"
+    r = s.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=5, show_spinner=False)
 def fetch_snapshot(market_id: int, user_id: int | None):
+    s = http_session()
     with ThreadPoolExecutor(max_workers=4) as ex:
-        fut_market   = ex.submit(_get, f"/market/{market_id}")
-        fut_tx       = ex.submit(_get, "/tx")
-        fut_users    = ex.submit(_get, "/users")
-        fut_holdings = ex.submit(_get, f"/holdings/{user_id}") if user_id else []
-    return {
-        "market": fut_market.result(),
-        "tx": fut_tx.result(),
-        "users": fut_users.result(),
-        "holdings": fut_holdings.result() if fut_holdings else []
-    }
+        fut_market   = ex.submit(_get, f"/market/{market_id}", 5.0, s)
+        fut_tx       = ex.submit(_get, "/tx", 5.0, s)
+        fut_users    = ex.submit(_get, "/users", 5.0, s)
+        fut_user     = ex.submit(_get, f"/users/{user_id}", 5.0, s)     if user_id else None
+        fut_holdings = ex.submit(_get, f"/holdings/{user_id}", 5.0, s)  if user_id else None
 
-# Use it ONCE
+        return {
+            "market":   fut_market.result(),
+            "tx":       fut_tx.result(),
+            "users":    fut_users.result(),
+            "user":     (fut_user.result() if fut_user else None),
+            "holdings": (fut_holdings.result() if fut_holdings else []),
+        }
+
+
+# Cache & use snap as global state
 snap = fetch_snapshot(MARKET_ID, st.session_state.get("user_id"))
+
+# Market
 m = snap["market"]
+reserves: List[dict] = m.get("reserves", [])
+
+# Transactions
 tx_raw = pd.DataFrame(snap["tx"])
+
+# Users
 users_df_all = pd.DataFrame(snap["users"])
+users_count = len(users_df_all)
+
+# User holdings
 user_holdings_list = snap["holdings"]
+
 
 def interpret_market(srv: dict):
     """
@@ -153,8 +177,8 @@ st.title("42: Dynamic Pari-mutuel — Global PVP")
 
 st.subheader(f":blue[{MARKET_QUESTION}]")
 
-srv = api_get(f"/market/{MARKET_ID}")
-server_active, server_why = interpret_market(srv)
+
+server_active, server_why = interpret_market(m)
 # Use server_active for button disabled
 disabled = ('user_id' not in st.session_state) or (not server_active)
 
@@ -165,22 +189,11 @@ def st_display_market_status(active, reason=''):
         st.markdown(f":gray-badge[Inactive] ({server_why})")
 
 # ===========================================================
-# # Math Helpers (curves)
-# def buy_curve(x: float) -> float:
-#     return x**(1/4) + x / 400
-
-# def sell_curve(x: float) -> float:
-#     return ((x - 500)/40) / ((8 + ((x - 500)/80)**2)**0.5) + (x - 500)/300 + 3.6
 
 def buy_curve(x: float) -> float:
     """price to buy an infinitesimal share at reserve x"""
     return (float(x) ** (1.0 / 3.0)) / 1000.0 + 0.1
 
-# def sell_curve(x: float) -> float:
-#     """price to sell an infinitesimal share at reserve x (clamped >= 0)"""
-#     t = (float(x) - 500_000.0) / 1_000_000.0
-#     p = 1.0 / (4.0 * (0.8 + math.exp(-t))) - 0.05
-#     return max(p, 0.0)
 
 def buy_delta(x: float) -> float:
     """
@@ -189,15 +202,6 @@ def buy_delta(x: float) -> float:
     """
     x = float(x)
     return (3.0 / 4000.0) * (x ** (4.0 / 3.0)) + x / 10.0
-
-# def sell_delta(x: float) -> float:
-#     """
-#     ∫ sell_curve dx = 312500 * ln(1 + 0.8 * e^{(x-500000)/1e6}) - 0.05*x   (C=0)
-#     Use log1p for stability.
-#     """
-#     x = float(x)
-#     t = (x - 500_000.0) / 1_000_000.0
-#     return 312_500.0 * math.log1p(0.8 * math.exp(t)) - 0.05 * x
 
 
 # ---------------------------
@@ -375,7 +379,7 @@ def format_usdc_compact(value: float) -> str:
 
 def load_users_df() -> pd.DataFrame:
     try:
-        data = api_get("/users")
+        data = snap["users"]
     except Exception:
         return pd.DataFrame(columns=["id", "username", "balance"])
 
@@ -413,33 +417,6 @@ def load_users_df() -> pd.DataFrame:
             df[col] = pd.Series(dtype=dtype)
 
     return df[["id", "username", "balance"]]
-
-# Binary searches
-
-# def qty_from_buy_usdc(reserve: int, usdc_amount: float) -> int:
-#     low, high = 0.0, 10000.0
-#     eps = BASE_EPSILON
-#     while high - low > eps:
-#         mid = (low + high) / 2
-#         delta = buy_delta(reserve + mid) - buy_delta(reserve)
-#         if delta < usdc_amount:
-#             low = mid
-#         else:
-#             high = mid
-#     return max(0, math.floor(low))
-
-
-# def qty_from_sell_usdc(reserve: int, usdc_amount: float) -> int:
-#     low, high = 0.0, float(reserve)
-#     eps = BASE_EPSILON
-#     while high - low > eps:
-#         mid = (low + high) / 2
-#         delta = sell_delta(reserve) - sell_delta(reserve - mid)
-#         if delta < usdc_amount:
-#             low = mid
-#         else:
-#             high = mid
-#     return max(0, math.floor(low))
 
 # ===========================================================
 # Double check
@@ -648,7 +625,7 @@ def compute_points_timeline(txp: pd.DataFrame, users_df: pd.DataFrame) -> pd.Dat
 
     return pd.DataFrame(rows)
 
-m = api_get(f"/market/{MARKET_ID}")                      # ← Fetch Market
+                   # ← Fetch Market
 market_start = pd.to_datetime(m["start_ts"])
 market_end_db = pd.to_datetime(m["end_ts"])
 winner_token = m.get('winner_token')
@@ -751,8 +728,7 @@ ensure_user_session()
 # Refresh session balance snapshot
 if "user_id" in st.session_state:
     try:
-        u = api_get(f"/users/{st.session_state.user_id}")
-        print('u---->', u)
+        u = snap['user']
         st.session_state.balance = float(u["balance"])
     except APIError as e:
         st.warning(f"Could not refresh balance: {e}")
@@ -899,13 +875,13 @@ if 'user_id' not in st.session_state:
         
 if 'user_id' in st.session_state:
     # --- live snapshots via API ---
-    u = api_get(f"/users/{st.session_state.user_id}")
+    # u = user_state
     bal = float(u["balance"])
 
-    user_holdings_list = api_get(f"/holdings/{st.session_state.user_id}")
+    # user_holdings_list = user_holdings_list
     user_holdings = {h["token"]: int(h["shares"]) for h in user_holdings_list}
 
-    reserves_list = api_get(f"/market/{MARKET_ID}").get('reserves')
+    reserves_list = m.get('reserves')
     global_reserves = {r["token"]: int(r["shares"]) for r in reserves_list}
 
     # Prices from current reserves (buy curve)
@@ -947,7 +923,7 @@ if 'user_id' in st.session_state:
             with overall_cols[1]:
                 # Pull all tx from API and normalize columns for compute_user_points()
                 try:
-                    txp_pts = pd.DataFrame(api_get("/tx"))
+                    txp_pts = tx_raw
                 except APIError as e:
                     st.error(f"Could not load transactions: {e}")
                     txp_pts = pd.DataFrame()
@@ -976,7 +952,7 @@ if 'user_id' in st.session_state:
 
                     # Users list (prefer API; fallback from tx)
                     try:
-                        users_list = api_get("/users")  # if implemented
+                        users_list = users_df_all  # if implemented
                         users_df_pts = pd.DataFrame(users_list)[["id", "username"]]
                         
                     except APIError:
@@ -1045,7 +1021,7 @@ if user_id is not None:
     basis = compute_cost_basis_from_df(tx_user_raw)
 
     # 2) Pull reserves from API (not sqlite)
-    reserves_list = api_get(f"/market/{MARKET_ID}").get('reserves')
+    reserves_list = m.get('reserves')
     reserves_now = {r["token"]: {"shares": int(r["shares"]), "usdc": float(r["usdc"])} for r in reserves_list}
     total_pool_now = float(sum(r["usdc"] for r in reserves_now.values()))
 
@@ -1107,11 +1083,11 @@ cols = st.columns(4)
 
 # Fetch current reserves (DB)
 # Reserves from market API
-reserves_list = api_get(f"/market/{MARKET_ID}").get("reserves")
+reserves_list = m.get("reserves")
 reserves_map = {r["token"]: {"shares": int(r["shares"]), "usdc": float(r["usdc"])} for r in reserves_list}
 
 # Holdings for logged-in user
-user_holdings_list = api_get(f"/holdings/{st.session_state.user_id}") if "user_id" in st.session_state else []
+user_holdings_list = user_holdings_list
 user_holdings = {h["token"]: int(h["shares"]) for h in user_holdings_list}
 
 # Prices (unchanged — uses your curves)
@@ -1192,7 +1168,6 @@ for i, token in enumerate(TOKENS):
                     except APIError as e:
                         st.error(str(e))
    
-
         # --- SELL ---
         with sell_col:
             disabled = ('user_id' not in st.session_state) or (not active)
@@ -1223,7 +1198,7 @@ for i, token in enumerate(TOKENS):
 # Dashboards (global)
 # ================================
 # Pull reserves from the Market API
-reserves_list = api_get(f"/market/{MARKET_ID}").get("reserves")
+reserves_list = m.get("reserves")
 res_df = pd.DataFrame(reserves_list)
 
 # Normalize to PrettyCaps schema used by the app
@@ -1255,16 +1230,6 @@ if not res_df.empty:
 res_tot_shares = int(res_df["Shares"].sum()) if "Shares" in res_df else 0
 res_tot_usdc   = float(res_df["USDC"].sum())  if "USDC"  in res_df else 0.0
 
-# Users count (works whether you expose /users/list or not)
-try:
-    users_df_all = pd.DataFrame(api_get("/users/list"))  # preferred
-    users_count = len(users_df_all)
-except Exception:
-    try:
-        stats = api_get("/stats")  # optional fallback if you added a stats endpoint
-        users_count = int(stats.get("users", 0))
-    except Exception:
-        users_count = 0
 
 st.subheader("Overall Market Metrics")
 mc_cols = st.columns(3)
@@ -1308,7 +1273,7 @@ for i, token in enumerate(TOKENS):
 # Logs & Charts (Transactions)
 # ================================
 # Fetch and normalize /tx to match PrettyCaps schema used by charts
-tx_raw = pd.DataFrame(api_get("/tx"))  # expect keys like ts, user, user_id, action, token, qty, ...
+# expect keys like ts, user, user_id, action, token, qty, ...
 rename_map = {
     "ts": "Time",
     "user": "User",
@@ -1325,7 +1290,7 @@ rename_map = {
 tx = tx_raw.rename(columns=rename_map)
 
 # Ensure required columns exist (handles empty or partial payloads)
-required_cols = ["Time", "User", "user_id", "Action", "Outcome", "Quantity", "BuyAmt_Delta", "SellAmt_Delta"]
+required_cols = ["Time", "user_name", "user_id", "Action", "Outcome", "Quantity", "BuyAmt_Delta", "SellAmt_Delta"]
 for c in required_cols:
     if c not in tx.columns:
         tx[c] = pd.Series(dtype="float" if c in ["Quantity","BuyAmt_Delta","SellAmt_Delta"] else "object")
@@ -1343,6 +1308,7 @@ tx = tx.dropna(subset=["Time"]) if "Time" in tx.columns else tx
 
 # Pretty display copy
 tx_display = tx.copy()
+
 float_cols = tx_display.select_dtypes(include=["float64", "float32", "float"]).columns
 for col in float_cols:
     tx_display[col] = tx_display[col].map(lambda x: f"{x:.4f}" if pd.notnull(x) else "-")
@@ -1456,21 +1422,6 @@ def fetch_market_with_reserves(market_id: int) -> dict:
     # assuming api_get joins base+path internally or accepts absolute paths
     return api_get(f"/market/{market_id}", timeout=10)
 
-# ---------------------------
-# Render
-# ---------------------------
-market_id = 1
-with st.spinner("Loading market & reserves..."):
-    try:
-        market = fetch_market_with_reserves(market_id)
-    except requests.HTTPError as e:
-        st.error(f"Failed to load market {market_id}: {e.response.text}")
-        st.stop()
-    except Exception as e:
-        st.error(f"Failed to load market {market_id}: {e}")
-        st.stop()
-
-reserves: List[dict] = market.get("reserves", [])
 if not reserves:
     st.info("No reserves found for this market.")
     st.stop()
@@ -1616,13 +1567,14 @@ for token, token_tab in zip(TOKENS, token_tabs):
  # ===========================================================
 
 # Always fetch tx + users once
-txp = pd.DataFrame(api_get("/tx"))
+txp = tx_raw
 if txp.empty:
     pass
 
 # Normalize txp for your plotting helpers:
 else:
-    users_df = pd.DataFrame(api_get("/users"))[["id","username"]]
+    # users_df = pd.DataFrame(api_get("/users"))[["id","username"]]
+    users_df = pd.DataFrame(users_df_all)[["id","username"]]
     txp = txp.rename(columns={
         "ts":"Time","user":"User","action":"Action","token":"Outcome",
         "qty":"Quantity","buy_delta":"BuyAmt_Delta","sell_delta":"SellAmt_Delta","user_id":"user_id"
@@ -1785,7 +1737,7 @@ if not txp.empty:
         st.info("No users found (or /users returned an unexpected shape).")
     else:
         # 1) Latest reserves and mark-to-curve prices
-        reserves_latest = api_get(f"/market/{MARKET_ID}").get('reserves')
+        reserves_latest = m.get('reserves')
         res_map_shares = {r["token"]: int(r["shares"]) for r in reserves_latest}
         price_now = {t: float(buy_curve(res_map_shares.get(t, 0))) for t in TOKENS}
 

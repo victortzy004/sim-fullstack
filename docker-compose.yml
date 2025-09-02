@@ -78,21 +78,21 @@ services:
       --root-path /api
     # 'root-path' required for production deployment
 
-  frontend:
-    build:
-      context: ./frontend
-    environment:
-      API_BASE_URL: "http://api_sim:8001" # <— use api_sim service
-    command: >
-      sh -c "python -m streamlit run app.py
-            --server.port=8505
-            --server.address=0.0.0.0
-            --browser.gatherUsageStats=false"
-    ports:
-      - "8505:8501"
-    depends_on:
-      - api_sim
-    restart: unless-stopped
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #   environment:
+  #     API_BASE_URL: "http://api_sim:8001" # <— use api_sim service
+  #   command: >
+  #     sh -c "python -m streamlit run app.py
+  #           --server.port=8505
+  #           --server.address=0.0.0.0
+  #           --browser.gatherUsageStats=false"
+  #   ports:
+  #     - "8505:8501"
+  #   depends_on:
+  #     - api_sim
+  #   restart: unless-stopped
 
 volumes:
   dbdata:

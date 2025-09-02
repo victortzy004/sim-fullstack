@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# http://api:8000 for production, http://localhost:8000 for local
 ENV API_BASE_URL=http://api:8000
 EXPOSE 8505
 
