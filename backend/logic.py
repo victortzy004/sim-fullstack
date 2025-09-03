@@ -67,7 +67,7 @@ def sale_tax_rate(q: int, C: int) -> float:
     """
     if C <= 0 or q <= 0:
         return 0.0
-    X = q / float(C)  # fraction of supply this order is selling
+    X = _clamp01(float(q) / float(C))  # fraction of supply this order is selling
     base = 1.15 - 1.3 / (1.0 + math.e ** (4.0 * X - 2.0))
     # scale = C * math.e ** ((C / 100000.0 - 1.0) / 10000.0)
     # tax = base * scale

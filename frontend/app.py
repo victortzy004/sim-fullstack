@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 # ROOT = Path(__file__).resolve().parents[1]
 # load_dotenv(ROOT / ".env")   # make variables visible to os.getenv
 BASE = "http://concept.alkimiya.io/simpi"
-# BASE = "http://localhost:8000/"
+
 
 st.caption(f"API_BASE_URL: {BASE}")
 
@@ -34,17 +34,17 @@ MARKET_DURATION_DAYS = 5
 END_TS = "2025-09-07 00:00"
 MAX_SHARES = 5000000 #10M
 STARTING_BALANCE = 10000.0
+BINARY_OUTCOME_TOKENS = ["YES", "NO"]
 
 MARKET_ID = 1
 
-MARKET_QUESTION = "Will the NASA TOMEX+ sounding rocket mission successfully launch from the Wallops Range by Sunday, August 24, 2025?" # @To-do: Replace
+MARKET_QUESTION = "Price of Ethereum greater than $4500 by 7th Sept?"
 RESOLUTION_NOTE = (
-'This market will resolve to "YES" if the NASA TOMEX+ sounding rocket is successfully launched from the Wallops Range in New Mexico by 11:59 PM EDT on Sunday, August 24, 2025.' 
-'"Successfully launched" means the rocket leaves the launch pad as intended, regardless of the outcome of the mission itself.'
-'The market will resolve to "NO" if the launch is scrubbed, delayed past the deadline, or if there is no successful launch attempt by the end of the day on Sunday. Resolution will be based on official announcements from NASA and live coverage from reliable news sources.'
-) # @To-do: Replace
-# TOKENS = ["<4200", "4200-4600", ">4600"]
-TOKENS = ["YES", "NO"]
+    'This market will resolve according to the price chart of the '
+    'Binance Spot Market ETH/USDT until the end of deadline (7th Sept 12:00 UTC).'
+)
+# TOKENS = ["<4500", "4300-4700", ">4700"]
+TOKENS = BINARY_OUTCOME_TOKENS
 
 # Whitelisted usernames and admin reset control
 WHITELIST = {"admin", "rui", "haoye", "leo", "steve", "wenbo", "sam", "sharmaine", "mariam", "henry", "guard", "victor", "toby"}
@@ -85,8 +85,30 @@ def _get(path: str, timeout: float = 5.0, session: requests.Session | None = Non
     r.raise_for_status()
     return r.json()
 
+# @st.cache_data(ttl=5, show_spinner=False)
+# def fetch_snapshot(market_id: int, user_id: int | None):
+#     s = http_session()
+#     with ThreadPoolExecutor(max_workers=4) as ex:
+#         fut_market   = ex.submit(_get, f"/market/{market_id}", 5.0, s)
+#         fut_tx       = ex.submit(_get, "/tx", 5.0, s)
+#         fut_users    = ex.submit(_get, "/users", 5.0, s)
+#         fut_user     = ex.submit(_get, f"/users/{user_id}", 5.0, s)     if user_id else None
+#         fut_holdings = ex.submit(_get, f"/holdings/{user_id}", 5.0, s)  if user_id else None
+
+#         return {
+#             "market":   fut_market.result(),
+#             "tx":       fut_tx.result(),
+#             "users":    fut_users.result(),
+#             "user":     (fut_user.result() if fut_user else None),
+#             "holdings": (fut_holdings.result() if fut_holdings else []),
+#         }
+
+
+# # Cache & use snap as global state
+# snap = fetch_snapshot(MARKET_ID, st.session_state.get("user_id"))
+
 @st.cache_data(ttl=5, show_spinner=False)
-def fetch_snapshot(market_id: int, user_id: int | None):
+def fetch_snapshot(market_id: int, user_id: int | None, version: int = 0):
     s = http_session()
     with ThreadPoolExecutor(max_workers=4) as ex:
         fut_market   = ex.submit(_get, f"/market/{market_id}", 5.0, s)
@@ -94,7 +116,6 @@ def fetch_snapshot(market_id: int, user_id: int | None):
         fut_users    = ex.submit(_get, "/users", 5.0, s)
         fut_user     = ex.submit(_get, f"/users/{user_id}", 5.0, s)     if user_id else None
         fut_holdings = ex.submit(_get, f"/holdings/{user_id}", 5.0, s)  if user_id else None
-
         return {
             "market":   fut_market.result(),
             "tx":       fut_tx.result(),
@@ -103,9 +124,8 @@ def fetch_snapshot(market_id: int, user_id: int | None):
             "holdings": (fut_holdings.result() if fut_holdings else []),
         }
 
-
-# Cache & use snap as global state
-snap = fetch_snapshot(MARKET_ID, st.session_state.get("user_id"))
+ver = st.session_state.get("snap_version", 0)
+snap = fetch_snapshot(MARKET_ID, st.session_state.get("user_id"), ver)
 
 # Market
 m = snap["market"]
@@ -240,7 +260,7 @@ def sale_tax_rate(q: int, C: int) -> float:
     """
     if C <= 0 or q <= 0:
         return 0.0
-    X = q / float(C)  # fraction of supply this order is selling
+    X = _clamp01(float(q) / float(C))  # fraction of supply this order is selling
     base = 1.15 - 1.3 / (1.0 + math.e ** (4.0 * X - 2.0))
     # scale = C * math.e ** ((C / 100000.0 - 1.0) / 10000.0)
     # tax = base * scale
@@ -862,10 +882,7 @@ if 'user_id' not in st.session_state:
                 </p>
                 <h5>🔗 Resolution Sources/Resources:</h5>
                 <ul>
-                    <li><a href="https://www.nasa.gov/blogs/wallops/2025/08/15/turbulence-at-edge-of-space/" target="_blank">
-                        NASA Blog: Turbulence at Edge of Space (Aug 15, 2025)</a></li>
-                    <li><a href="https://www.nasa.gov/blogs/wallops-range/" target="_blank">
-                        NASA Wallops Range Blog</a></li>
+                        <li><a href="https://www.binance.com/en/trade/ETH_USDT?type=spot/" target="_blank">Binance International: ETH/USDT Spot Market</a></li>
                 </ul>
             </div>
             """,
@@ -1095,10 +1112,9 @@ prices = {t: float(buy_curve(reserves_map.get(t, {}).get("shares", 0))) for t in
 
 for i, token in enumerate(TOKENS):
 
-    
     with cols[i]:
         st.markdown(f"### Outcome :blue[{token}]")
-
+        print(reserves_map)
         reserve = int(reserves_map[token]["shares"])  # global shares for token
         price_now = round(buy_curve(reserve), 2)
         mcap_now = round(reserves_map[token]["usdc"], 2)
@@ -1164,6 +1180,7 @@ for i, token in enumerate(TOKENS):
                     }
                     try:
                         api_post("/trade", json=payload)
+                        st.session_state["snap_version"] = st.session_state.get("snap_version", 0) + 1
                         st.rerun()
                     except APIError as e:
                         st.error(str(e))

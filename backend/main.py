@@ -372,7 +372,7 @@ def admin_resolve(
             continue
         u.balance = float(u.balance or 0.0) + float(amt)
         db.add(Tx(
-            ts=now_iso, user_id=uid, action="Resolve", token=winner_token,
+            ts=now_iso, user_id=uid, user_name=u.username, action="Resolve", token=winner_token,
             qty=0, buy_price=None, sell_price=None, buy_delta=None, sell_delta=float(amt),
             balance_after=u.balance
         ))
