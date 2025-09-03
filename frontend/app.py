@@ -50,8 +50,8 @@ TOKENS = BINARY_OUTCOME_TOKENS
 WHITELIST = {"admin", "rui", "haoye", "leo", "steve", "wenbo", "sam", "sharmaine", "mariam", "henry", "guard", "victor", "toby"}
 
 # Inflection Points
-EARLY_QUANTITY_POINT = 270
-MID_QUANTITY_POINT = 630
+EARLY_QUANTITY_POINT = 5000000 # 0.5M
+MID_QUANTITY_POINT = 2500000 # 2.5M
 
 # ==== Points System (tunable) ====
 TRADE_POINTS_PER_USD = 10.0   # Buy & Sell volume → 10 pts per $1 traded
@@ -84,28 +84,6 @@ def _get(path: str, timeout: float = 5.0, session: requests.Session | None = Non
     r = s.get(url, timeout=timeout)
     r.raise_for_status()
     return r.json()
-
-# @st.cache_data(ttl=5, show_spinner=False)
-# def fetch_snapshot(market_id: int, user_id: int | None):
-#     s = http_session()
-#     with ThreadPoolExecutor(max_workers=4) as ex:
-#         fut_market   = ex.submit(_get, f"/market/{market_id}", 5.0, s)
-#         fut_tx       = ex.submit(_get, "/tx", 5.0, s)
-#         fut_users    = ex.submit(_get, "/users", 5.0, s)
-#         fut_user     = ex.submit(_get, f"/users/{user_id}", 5.0, s)     if user_id else None
-#         fut_holdings = ex.submit(_get, f"/holdings/{user_id}", 5.0, s)  if user_id else None
-
-#         return {
-#             "market":   fut_market.result(),
-#             "tx":       fut_tx.result(),
-#             "users":    fut_users.result(),
-#             "user":     (fut_user.result() if fut_user else None),
-#             "holdings": (fut_holdings.result() if fut_holdings else []),
-#         }
-
-
-# # Cache & use snap as global state
-# snap = fetch_snapshot(MARKET_ID, st.session_state.get("user_id"))
 
 @st.cache_data(ttl=5, show_spinner=False)
 def fetch_snapshot(market_id: int, user_id: int | None, version: int = 0):
@@ -837,59 +815,59 @@ if 'user_id' not in st.session_state:
 
 # ===========================================================
 # Trading UI
-    if resolved_flag == 1 and winner_token:
-        # Market resolved - show outcome highlight
-        st.markdown(
-            f"""
-            <div style="
-                background-color: orange;
-                padding: 1rem;
-                border-radius: 0.5rem;
-                border: 1px solid #b2f2bb;
-                margin-bottom: 1rem;
-            ">
-                <h4 style="margin-top: 0;">✅ Market Resolved</h4>
-                <p>
-                    The winning outcome is <b style="color: green;">{winner_token}</b>.
-                    Settlement occurred on <b>{pd.to_datetime(resolved_ts).strftime('%Y-%m-%d %H:%M UTC')}</b>.
-                </p>
-                <p>All holdings in this outcome have been paid out proportionally from the total USDC pool.</p>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-    else:
-        st.markdown(
-            f"""
-            <div style="
-                background-color: grey;
-                padding: 1rem;
-                border-radius: 0.5rem;
-                border: 1px solid #a5b4fc;
-                margin-bottom: 1rem;
-            ">
-                <h4 style="margin-top: 0;">📜 Resolution Rules</h4>
-                <p>
-                    The market will resolve at <b>{END_TS}</b>.
-                    The winning outcome will receive the <b>entire USDC pool</b>,
-                    distributed <i>pro-rata</i> to holders based on their share count.
-                </p>
-                <p>
-                    <b>Resolution Note:</b> {RESOLUTION_NOTE}
-                </p>
-                <p>
-                    After resolution, all holdings will be cleared and balances updated automatically.
-                </p>
-                <h5>🔗 Resolution Sources/Resources:</h5>
-                <ul>
-                        <li><a href="https://www.binance.com/en/trade/ETH_USDT?type=spot/" target="_blank">Binance International: ETH/USDT Spot Market</a></li>
-                </ul>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-        st.divider()
-        
+if resolved_flag == 1 and winner_token:
+    # Market resolved - show outcome highlight
+    st.markdown(
+        f"""
+        <div style="
+            background-color: orange;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            border: 1px solid #b2f2bb;
+            margin-bottom: 1rem;
+        ">
+            <h4 style="margin-top: 0;">✅ Market Resolved</h4>
+            <p>
+                The winning outcome is <b style="color: green;">{winner_token}</b>.
+                Settlement occurred on <b>{pd.to_datetime(resolved_ts).strftime('%Y-%m-%d %H:%M UTC')}</b>.
+            </p>
+            <p>All holdings in this outcome have been paid out proportionally from the total USDC pool.</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+else:
+    st.markdown(
+        f"""
+        <div style="
+            background-color: grey;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            border: 1px solid #a5b4fc;
+            margin-bottom: 1rem;
+        ">
+            <h4 style="margin-top: 0;">📜 Resolution Rules</h4>
+            <p>
+                The market will resolve at <b>{END_TS}</b>.
+                The winning outcome will receive the <b>entire USDC pool</b>,
+                distributed <i>pro-rata</i> to holders based on their share count.
+            </p>
+            <p>
+                <b>Resolution Note:</b> {RESOLUTION_NOTE}
+            </p>
+            <p>
+                After resolution, all holdings will be cleared and balances updated automatically.
+            </p>
+            <h5>🔗 Resolution Sources/Resources:</h5>
+            <ul>
+                    <li><a href="https://www.binance.com/en/trade/ETH_USDT?type=spot/" target="_blank">Binance International: ETH/USDT Spot Market</a></li>
+            </ul>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+    st.divider()
+    
 if 'user_id' in st.session_state:
     # --- live snapshots via API ---
     # u = user_state
@@ -1114,7 +1092,7 @@ for i, token in enumerate(TOKENS):
 
     with cols[i]:
         st.markdown(f"### Outcome :blue[{token}]")
-        print(reserves_map)
+
         reserve = int(reserves_map[token]["shares"])  # global shares for token
         price_now = round(buy_curve(reserve), 2)
         mcap_now = round(reserves_map[token]["usdc"], 2)
@@ -1508,15 +1486,6 @@ for token, token_tab in zip(TOKENS, token_tabs):
                 x=[xs.min(), reserve], y=[buy_price_now, buy_price_now],
                 mode='lines', line=dict(dash='dot'), showlegend=False
             ))
-            # If you also plot sell_net_vals, you can add matching helper lines:
-            # fig_curve.add_trace(go.Scatter(
-            #     x=[reserve, reserve], y=[y0, sell_net_now],
-            #     mode='lines', line=dict(dash='dot'), showlegend=False
-            # ))
-            # fig_curve.add_trace(go.Scatter(
-            #     x=[xs.min(), reserve], y=[sell_net_now, sell_net_now],
-            #     mode='lines', line=dict(dash='dot'), showlegend=False
-            # ))
 
             fig_curve.update_layout(
                 title=f'{token} — Buy vs Sell (net, 1 share)',
