@@ -10,7 +10,7 @@ from dotenv import load_dotenv, find_dotenv
 from .db import Base, engine, get_db
 from .models import User, Market, Reserve, Holding, Tx
 from .schemas import *
-from .logic import do_trade, compute_user_points, is_market_active, metrics_from_qty, STARTING_BALANCE, MARKET_DURATION_DAYS, TOKENS
+from .logic import do_trade, compute_user_points, is_market_active, preview_for_side_mode, STARTING_BALANCE, MARKET_DURATION_DAYS, TOKENS
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -515,16 +515,18 @@ def leaderboard(db: Session = Depends(get_db)):
 @app.post("/preview/{market_id}/{token}",
           response_model=PreviewResponse,
           tags=["Trading"],
-          summary="Preview buy/sell metrics given current reserve and a quantity (no state change)")
+          summary="Preview buy/sell metrics (side+mode+amount) with no state change")
 def preview_metrics(
     market_id: Annotated[int, Path(..., ge=1, description="Market ID", example=1)],
-    token: Annotated[str, Path(..., description=f"Outcome token (e.g. 'YES'). Valid options: {TOKENS}", example="YES")],
+    token: Annotated[str, Path(..., description="Outcome token (e.g. 'YES')", example="YES")],
     req: PreviewRequest,
     db: Session = Depends(get_db),
 ):
     token = token.strip().upper()
-    if token not in TOKENS:
-        raise HTTPException(status_code=400, detail="Invalid token")
+
+    # # validate against THIS market's outcomes
+    # if token not in list_market_outcomes(db, market_id):
+    #     raise HTTPException(status_code=400, detail=f"Invalid token for market {market_id}")
 
     r = (
         db.query(Reserve)
@@ -535,21 +537,25 @@ def preview_metrics(
         raise HTTPException(status_code=404, detail="Reserve not found for this market/token")
 
     reserve = int(r.shares or 0)
-    q = int(req.quantity or 0)
 
-    buy_price, sell_price, buy_amt, sell_amt, tax_used = metrics_from_qty(reserve, q)
+    res = preview_for_side_mode(
+        reserve,
+        side=req.side,
+        mode=req.mode,
+        amount=req.amount,
+    )
 
     return PreviewResponse(
         market_id=market_id,
         token=token,
         reserve=reserve,
-        quantity=q,
-        new_reserve=reserve + q,
-        buy_price=buy_price,
-        sell_price_marginal_net=sell_price,
-        buy_amt_delta=buy_amt,
-        sell_amt_delta=sell_amt,
-        sell_tax_rate_used=tax_used,
+        quantity=res["quantity"],
+        new_reserve=res["new_reserve"],
+        buy_price=res["buy_price"],
+        sell_price_marginal_net=res["sell_price_marginal_net"],
+        buy_amt_delta=res["buy_amt_delta"],
+        sell_amt_delta=res["sell_amt_delta"],
+        sell_tax_rate_used=res["sell_tax_rate_used"],
     )
 
 # --- Middleware ---

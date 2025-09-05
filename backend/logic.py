@@ -1,8 +1,8 @@
 import math
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, Optional
 from sqlalchemy.orm import Session
-from sqlalchemy import select, func, update, delete
+from sqlalchemy import select
 from .models import User, Market, Reserve, Holding, Tx
 
 
@@ -222,6 +222,7 @@ def is_market_active(m) -> bool:
     ok, _ = is_market_active_with_reason(m)
     return ok
 
+
 # ---- Trading endpoints logic ----
 def do_trade(db: Session, user_id: int, token: str, side: str, mode: str, amount: float):
     # 0) Market must be active (single source of truth)
@@ -330,6 +331,49 @@ def do_trade(db: Session, user_id: int, token: str, side: str, mode: str, amount
         ))
         db.commit()
         return {"status": "ok", "qty": qty, "proceeds": float(sell_amt_delta), "price": float(sell_price)}
+
+# Preview trade outcome
+def preview_for_side_mode(
+    reserve: int,
+    *,
+    side: str,            # "buy" | "sell"
+    mode: str,            # "qty" | "usdc"
+    amount: Optional[float],   # required by validator upstream
+) -> Dict[str, float | int]:
+    """
+    Pure computation for preview, no DB access.
+
+    - If mode="qty": treat `amount` as a quantity; round to nearest int and clamp to >= 0.
+    - If mode="usdc": treat `amount` as USDC; derive quantity via qty_from_buy_usdc / qty_from_sell_usdc.
+    """
+    side = (side or "").strip().lower()
+    mode = (mode or "").strip().lower()
+    if side not in ("buy", "sell"):
+        raise ValueError("side must be 'buy' or 'sell'")
+    if mode not in ("qty", "usdc"):
+        raise ValueError("mode must be 'qty' or 'usdc'")
+
+    if mode == "qty":
+        q = int(max(0, round(float(amount or 0.0))))
+    else:  # mode == "usdc"
+        usd = float(amount or 0.0)
+        q = qty_from_buy_usdc(reserve, usd) if side == "buy" else qty_from_sell_usdc(reserve, usd)
+
+    # Core preview math (existing semantics)
+    buy_price, sell_price, buy_amt, sell_amt, tax_used = metrics_from_qty(reserve, q)
+
+    # Prospective reserve after the action
+    new_reserve = reserve + q if side == "buy" else max(0, reserve - min(q, reserve))
+
+    return {
+        "quantity": int(q),
+        "new_reserve": int(new_reserve),
+        "buy_price": float(buy_price),
+        "sell_price_marginal_net": float(sell_price),
+        "buy_amt_delta": float(buy_amt),
+        "sell_amt_delta": float(sell_amt),
+        "sell_tax_rate_used": float(tax_used),
+    }
 
 # ---- Points + Leaderboard helpers (same math as app) ----
 def compute_user_points(db: Session):

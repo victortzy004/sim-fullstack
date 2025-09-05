@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Optional, List, Literal
 
 class HealthOut(BaseModel):
@@ -106,7 +106,22 @@ class PointsTimelineRow(BaseModel):
 
 # ---- Preview Schemas ----
 class PreviewRequest(BaseModel):
-    quantity: int
+    # trade-style inputs
+    side: Literal["buy", "sell"] = "buy"
+    mode: Literal["qty", "usdc"] = "qty"
+    # When mode="qty", interpret `amount` as a quantity (round to nearest int).
+    # When mode="usdc", interpret `amount` as USDC.
+    amount: Optional[float] = None
+
+    @model_validator(mode="after")
+    def _validate_amount(self):
+        if self.amount is None:
+            raise ValueError("amount is required")
+        if self.mode == "usdc" and float(self.amount) <= 0:
+            raise ValueError("amount must be > 0 when mode='usdc'")
+        if self.mode == "qty" and float(self.amount) < 0:
+            raise ValueError("amount (quantity) must be >= 0 when mode='qty'")
+        return self
 
 class PreviewResponse(BaseModel):
     market_id: int

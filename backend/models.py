@@ -27,6 +27,7 @@ class Market(Base):
         passive_deletes=True,
     )
 
+
 class Reserve(Base):
     __tablename__ = "reserves"
     id = Column(Integer, primary_key=True)
