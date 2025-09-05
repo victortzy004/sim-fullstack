@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Body, status, Path
+from fastapi import FastAPI, Depends, HTTPException, Body, status, Path, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List, Annotated
@@ -8,13 +8,16 @@ from textwrap import dedent
 from dotenv import load_dotenv, find_dotenv
 
 from .db import Base, engine, get_db
-from .models import User, Market, Reserve, Holding, Tx
+from .models import User, Market, Reserve, Holding, Tx, MarketOutcome
 from .schemas import *
-from .logic import do_trade, compute_user_points, is_market_active, metrics_from_qty, STARTING_BALANCE, MARKET_DURATION_DAYS, TOKENS
+from .logic import do_trade, compute_user_points, is_market_active, preview_for_side_mode, list_market_outcomes, STARTING_BALANCE, MARKET_DURATION_DAYS, TOKENS
 
 from fastapi.middleware.cors import CORSMiddleware
 
-
+DEFAULT_QUESTION = "Price of Ethereum greater than $4500 by 7th Sept?"
+DEFAULT_RES_NOTE = ("This market will resolve according to the price chart of the "
+                    "Binance Spot Market ETH/USDT until the end of deadline (7th Sept 12:00 UTC).")
+DEFAULT_OUTCOMES = ["YES", "NO"]  # or your 3 buckets
 
 # Load .env file for root path
 load_dotenv(find_dotenv(), override=False)
@@ -35,6 +38,8 @@ def _assert_admin(pw: str):
 def _now_iso():
     # no timezone suffix, matches _parse_ts above
     return datetime.utcnow().replace(microsecond=0).isoformat()
+
+
 
 
 
@@ -86,6 +91,26 @@ app = FastAPI(
     },
 )
 
+def _market_to_out(db: Session, m: Market) -> MarketOut:
+    tokens = [
+        o.token
+        for o in db.query(MarketOutcome)
+                   .filter(MarketOutcome.market_id == m.id)
+                   .order_by(MarketOutcome.sort_order.asc(), MarketOutcome.token.asc())
+                   .all()
+    ]
+    return MarketOut(
+        id=m.id,
+        start_ts=m.start_ts,
+        end_ts=m.end_ts,
+        winner_token=m.winner_token,
+        resolved=int(m.resolved or 0),
+        resolved_ts=m.resolved_ts,
+        question=m.question or "",
+        resolution_note=m.resolution_note or "",
+        outcomes=tokens,
+    )
+
 
 
 def ensure_bootstrap(db: Session):
@@ -113,8 +138,13 @@ def startup():
                 end_ts=end_dt.isoformat(),
                 winner_token=None,
                 resolved=0,
-                resolved_ts=None
+                resolved_ts=None,
+                question=DEFAULT_QUESTION,
+                resolution_note=DEFAULT_RES_NOTE
             ))
+             # outcomes
+            for i, tok in enumerate(DEFAULT_OUTCOMES):
+                db.add(MarketOutcome(market_id=1, token=tok, display=tok, sort_order=i))
             for t in TOKENS:
                 db.add(Reserve(market_id=1, token=t, shares=0, usdc=0.0))
             db.commit()
@@ -215,8 +245,8 @@ def join_or_load_user(payload: UserCreate, db: Session = Depends(get_db)):
     db.flush()  # gets user.id
 
     # create zero holdings rows for each token
-    for t in TOKENS:
-        db.add(Holding(user_id=user.id, token=t, shares=0))
+    # for t in TOKENS:
+    #     db.add(Holding(user_id=user.id, token=t, shares=0))
 
     db.commit()
     db.refresh(user)
@@ -263,7 +293,8 @@ def admin_start(
 
     db.commit()
     db.refresh(m)
-    return m
+    return _market_to_out(db, m)
+
 
 # Admin market reset (makes market active)
 @app.post(
@@ -360,7 +391,7 @@ def admin_resolve(
     if tot_pool > 0 and win_shares > 0:
         # NOTE: If you ever run multiple markets concurrently,
         # you should add market_id to Holding and filter by it here.
-        for h in db.query(Holding).filter(Holding.token == winner_token, Holding.shares > 0).all():
+        for h in db.query(Holding).filter(Holding.token == winner_token, Holding.market_id == market_id, Holding.shares > 0).all():
             share = h.shares
             payout = tot_pool * (share / win_shares)
             payouts[h.user_id] = payouts.get(h.user_id, 0.0) + float(payout)
@@ -372,7 +403,7 @@ def admin_resolve(
             continue
         u.balance = float(u.balance or 0.0) + float(amt)
         db.add(Tx(
-            ts=now_iso, user_id=uid, user_name=u.username, action="Resolve", token=winner_token,
+            ts=now_iso, user_id=uid, market_id=market_id, user_name=u.username, action="Resolve", token=winner_token,
             qty=0, buy_price=None, sell_price=None, buy_delta=None, sell_delta=float(amt),
             balance_after=u.balance
         ))
@@ -393,6 +424,53 @@ def admin_resolve(
     db.commit()
     return {"status": "ok", "payout_pool": tot_pool, "winner_token": winner_token}
 
+# main.py
+@app.post("/admin/{market_id}/configure", tags=["Admin"], summary="Configure market copy & outcomes")
+def admin_configure(
+    market_id: int,
+    req: AdminConfigureMarketRequest,
+    db: Session = Depends(get_db),
+):
+    _assert_admin(req.password)
+
+    m = db.get(Market, market_id)
+    if not m:
+        raise HTTPException(404, "Market not found")
+
+    if req.question is not None:
+        m.question = req.question
+    if req.resolution_note is not None:
+        m.resolution_note = req.resolution_note
+
+    if req.tokens is not None:
+        tokens = [t.strip().upper() for t in req.tokens if t.strip()]
+        if not tokens:
+            raise HTTPException(400, "tokens must be non-empty")
+
+        # upsert outcomes (preserve order)
+        existing = {o.token for o in db.query(MarketOutcome).filter_by(market_id=market_id).all()}
+        # add/update
+        for i, tok in enumerate(tokens):
+            mo = db.query(MarketOutcome).filter_by(market_id=market_id, token=tok).first()
+            if mo:
+                mo.sort_order = i
+                mo.display = mo.display or tok
+            else:
+                db.add(MarketOutcome(market_id=market_id, token=tok, display=tok, sort_order=i))
+        # remove extras
+        for extra in existing - set(tokens):
+            db.query(MarketOutcome).filter_by(market_id=market_id, token=extra).delete()
+
+        # ensure reserves match outcomes (create missing, delete extras)
+        have = {r.token for r in db.query(Reserve).filter_by(market_id=market_id).all()}
+        for tok in set(tokens) - have:
+            db.add(Reserve(market_id=market_id, token=tok, shares=0, usdc=0.0))
+        for extra in have - set(tokens):
+            db.query(Reserve).filter_by(market_id=market_id, token=extra).delete()
+
+    db.commit()
+    return {"status": "ok"}
+
 
 # ====== Market ======
 @app.get("/markets",
@@ -400,7 +478,8 @@ def admin_resolve(
          tags=["Market"], summary="List all markets")
 def list_markets(db: Session = Depends(get_db)):
     """Return all markets (without reserves for brevity)."""
-    return db.query(Market).order_by(Market.id.asc()).all()
+    ms = db.query(Market).order_by(Market.id.asc()).all()
+    return [_market_to_out(db, m) for m in ms]
 
 
 @app.get("/market/{market_id}",
@@ -412,14 +491,25 @@ def get_market(market_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "Market not found")
 
     reserves = db.query(Reserve).filter(Reserve.market_id == market_id).all()
-
+    outcomes = (db.query(MarketOutcome)
+                  .filter(MarketOutcome.market_id == market_id)
+                  .order_by(MarketOutcome.sort_order.asc(), MarketOutcome.token.asc())
+                  .all())
+                  
+    base = _market_to_out(db, m)  # reuse the basic fields
     return MarketWithReservesOut(
-        id=m.id,
+        id=base.id,
         start_ts=m.start_ts,
         end_ts=m.end_ts,
         winner_token=m.winner_token,
         resolved=m.resolved,
         resolved_ts=m.resolved_ts,
+        question=m.question,
+        resolution_note=m.resolution_note,
+        outcomes=[
+            OutcomeOut(token=o.token, display=o.display, sort_order=int(o.sort_order or 0))
+            for o in outcomes
+        ],
         reserves=reserves,
     )
 
@@ -431,13 +521,17 @@ def get_market(market_id: int, db: Session = Depends(get_db)):
     response_model=List[HoldingOut],
     tags=["Holdings"],
     summary="Get holdings by user ID",
-    description="Returns all token holdings for the specified numeric user ID."
+    description="Returns token holdings for the user. Optional ?market_id filter; if omitted, returns across all markets."
 )
 def get_holdings(
     user_id: Annotated[int, Path(..., ge=1, description="Numeric user ID", example=1)],
+    market_id: Annotated[int | None, Query(ge=1, description="Optional market filter")] = None,
     db: Session = Depends(get_db),
 ):
-    return db.query(Holding).filter(Holding.user_id == user_id).all()
+    q = db.query(Holding).filter(Holding.user_id == user_id)
+    if market_id is not None:
+        q = q.filter(Holding.market_id == market_id)
+    return q.order_by(Holding.token.asc()).all()
 
 # Fetch user holdings via username
 @app.get(
@@ -445,21 +539,25 @@ def get_holdings(
     response_model=List[HoldingOut],
     tags=["Holdings"],
     summary="Get holdings by username",
-    description="Case-insensitive lookup. Returns 404 if the user does not exist."
+    description="Case-insensitive lookup. Optional ?market_id filter; if omitted, returns across all markets."
 )
 def get_holdings_by_username(
     username: Annotated[str, Path(..., min_length=1, description="Username (case-insensitive)", example="alice")],
+    market_id: Annotated[int | None, Query(ge=1, description="Optional market filter")] = None,
     db: Session = Depends(get_db),
 ):
     u = (
         db.query(User)
-        .filter(func.lower(User.username) == func.lower(username.strip()))
-        .first()
+          .filter(func.lower(User.username) == func.lower(username.strip()))
+          .first()
     )
     if not u:
         raise HTTPException(status_code=404, detail="User not found")
-    return db.query(Holding).filter(Holding.user_id == u.id).all()
 
+    q = db.query(Holding).filter(Holding.user_id == u.id)
+    if market_id is not None:
+        q = q.filter(Holding.market_id == market_id)
+    return q.order_by(Holding.token.asc()).all()
 
 # ====== Transaction Logs ======
 @app.get(
@@ -470,8 +568,14 @@ def get_holdings_by_username(
     description="Returns every transaction in the system ordered by timestamp (ascending). "
                 "Includes buys, sells, resolves, deltas, and post-trade balances."
 )
-def get_tx(db: Session = Depends(get_db)):
-    return db.query(Tx).order_by(Tx.ts.asc()).all()
+def get_tx(
+    market_id: Annotated[int | None, Query(ge=1, description="Filter by market id")] = None,
+    db: Session = Depends(get_db),
+):
+    q = db.query(Tx).order_by(Tx.ts.asc())
+    if market_id is not None:
+        q = q.filter(Tx.market_id == market_id)
+    return q.all()
 
 
 # ====== Trading ======
@@ -484,6 +588,7 @@ def trade(payload: TradeIn, db: Session = Depends(get_db)):
             db,
             user_id=payload.user_id,
             token=payload.token,
+            market_id=payload.market_id,
             side=payload.side.lower(),
             mode=payload.mode.lower(),  # "qty" or "usdc"
             amount=float(payload.amount),
@@ -511,20 +616,21 @@ def leaderboard(db: Session = Depends(get_db)):
 #     return [{"ts": now, "user": r["user"], "total_points": r["total_points"]} for r in rows]
 
 
-# ---- Preview Endpoint ----
 @app.post("/preview/{market_id}/{token}",
           response_model=PreviewResponse,
           tags=["Trading"],
-          summary="Preview buy/sell metrics given current reserve and a quantity (no state change)")
+          summary="Preview buy/sell metrics (side+mode+amount) with no state change")
 def preview_metrics(
     market_id: Annotated[int, Path(..., ge=1, description="Market ID", example=1)],
-    token: Annotated[str, Path(..., description=f"Outcome token (e.g. 'YES'). Valid options: {TOKENS}", example="YES")],
+    token: Annotated[str, Path(..., description="Outcome token (e.g. 'YES')", example="YES")],
     req: PreviewRequest,
     db: Session = Depends(get_db),
 ):
     token = token.strip().upper()
-    if token not in TOKENS:
-        raise HTTPException(status_code=400, detail="Invalid token")
+
+    # validate against THIS market's outcomes
+    if token not in list_market_outcomes(db, market_id):
+        raise HTTPException(status_code=400, detail=f"Invalid token for market {market_id}")
 
     r = (
         db.query(Reserve)
@@ -535,21 +641,25 @@ def preview_metrics(
         raise HTTPException(status_code=404, detail="Reserve not found for this market/token")
 
     reserve = int(r.shares or 0)
-    q = int(req.quantity or 0)
 
-    buy_price, sell_price, buy_amt, sell_amt, tax_used = metrics_from_qty(reserve, q)
+    res = preview_for_side_mode(
+        reserve,
+        side=req.side,
+        mode=req.mode,
+        amount=req.amount,
+    )
 
     return PreviewResponse(
         market_id=market_id,
         token=token,
         reserve=reserve,
-        quantity=q,
-        new_reserve=reserve + q,
-        buy_price=buy_price,
-        sell_price_marginal_net=sell_price,
-        buy_amt_delta=buy_amt,
-        sell_amt_delta=sell_amt,
-        sell_tax_rate_used=tax_used,
+        quantity=res["quantity"],
+        new_reserve=res["new_reserve"],
+        buy_price=res["buy_price"],
+        sell_price_marginal_net=res["sell_price_marginal_net"],
+        buy_amt_delta=res["buy_amt_delta"],
+        sell_amt_delta=res["sell_amt_delta"],
+        sell_tax_rate_used=res["sell_tax_rate_used"],
     )
 
 # --- Middleware ---

@@ -1,9 +1,9 @@
 import math
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, Optional
 from sqlalchemy.orm import Session
-from sqlalchemy import select, func, update, delete
-from .models import User, Market, Reserve, Holding, Tx
+from sqlalchemy import select
+from .models import User, Market, Reserve, Holding, Tx, MarketOutcome
 
 
 # To-do:
@@ -187,7 +187,7 @@ def ensure_seed(db: Session):
     # reserves
     for t in TOKENS:
         if not db.scalar(select(Reserve).where(Reserve.token==t)):
-            db.add(Reserve(token=t, shares=0, usdc=0.0))
+            db.add(Reserve(token=t, market_id=1, shares=0, usdc=0.0))
     db.commit()
 
 
@@ -222,13 +222,37 @@ def is_market_active(m) -> bool:
     ok, _ = is_market_active_with_reason(m)
     return ok
 
+# Market Outcomes: Return list of outcome tokens
+def list_market_outcomes(db: Session, market_id: int) -> list[str]:
+    return [
+        o.token
+        for o in db.query(MarketOutcome)
+                   .filter(MarketOutcome.market_id == market_id)
+                   .order_by(MarketOutcome.sort_order.asc(), MarketOutcome.token.asc())
+                   .all()
+    ]
+
+
+def ensure_user_holdings_for_market(db: Session, user_id: int, market_id: int):
+    existing = {
+        (h.token)
+        for h in db.query(Holding).filter_by(user_id=user_id, market_id=market_id).all()
+    }
+    for token in list_market_outcomes(db, market_id):
+        if token not in existing:
+            db.add(Holding(user_id=user_id, market_id=market_id, token=token, shares=0))
+    db.flush
+
 # ---- Trading endpoints logic ----
-def do_trade(db: Session, user_id: int, token: str, side: str, mode: str, amount: float):
+def do_trade(db: Session, user_id: int, token: str, market_id: int, side: str, mode: str, amount: float):
     # 0) Market must be active (single source of truth)
     m = db.get(Market, 1)
     ok, why = is_market_active_with_reason(m)
     if not ok:
         raise ValueError(f"Market not active: {why}")
+
+    # sanity check
+    # ensure_user_holdings_for_market(db, user_id, market_id)
 
     # 1) Basic input validation
     if token not in TOKENS:
@@ -253,14 +277,14 @@ def do_trade(db: Session, user_id: int, token: str, side: str, mode: str, amount
     #   NOTE: don't use db.get(Reserve, token) unless token is the PK.
     res = db.scalar(select(Reserve).where(Reserve.token == token))
     if res is None:
-        res = Reserve(token=token, shares=0, usdc=0.0)
+        res = Reserve(token=token, market_id=market_id, shares=0, usdc=0.0)
         db.add(res)
         db.flush()
 
     # 4) Load or create holding row for (user, token)
     hold = db.scalar(select(Holding).where(Holding.user_id == user_id, Holding.token == token))
     if hold is None:
-        hold = Holding(user_id=user_id, token=token, shares=0)
+        hold = Holding(user_id=user_id, market_id=market_id, token=token, shares=0)
         db.add(hold)
         db.flush()
 
@@ -279,7 +303,6 @@ def do_trade(db: Session, user_id: int, token: str, side: str, mode: str, amount
         raise ValueError("Quantity computed as 0.")
 
     now_iso = datetime.utcnow().replace(microsecond=0).isoformat()
-    print(user.username)
     username = user.username
 
     if side == "buy":
@@ -296,7 +319,7 @@ def do_trade(db: Session, user_id: int, token: str, side: str, mode: str, amount
 
         # tx log
         db.add(Tx(
-            ts=now_iso, user_id=user_id, user_name=username, action="Buy", token=token, qty=qty,
+            ts=now_iso, user_id=user_id,market_id=market_id, user_name=username, action="Buy", token=token, qty=qty,
             buy_price=float(buy_price), buy_delta=float(buy_amt_delta),
             sell_price=None, sell_delta=None,
             balance_after=float(user.balance),
@@ -323,13 +346,57 @@ def do_trade(db: Session, user_id: int, token: str, side: str, mode: str, amount
 
         # tx log
         db.add(Tx(
-            ts=now_iso, user_id=user_id, user_name=username, action="Sell", token=token, qty=qty,
+            ts=now_iso, user_id=user_id, market_id=market_id, user_name=username, action="Sell", token=token, qty=qty,
             buy_price=None, buy_delta=None,
             sell_price=float(sell_price), sell_delta=float(sell_amt_delta),
             balance_after=float(user.balance),
         ))
         db.commit()
         return {"status": "ok", "qty": qty, "proceeds": float(sell_amt_delta), "price": float(sell_price)}
+
+# Preview trade outcome
+def preview_for_side_mode(
+    reserve: int,
+    *,
+    side: str,            # "buy" | "sell"
+    mode: str,            # "qty" | "usdc"
+    amount: Optional[float],   # required by validator upstream
+) -> Dict[str, float | int]:
+    """
+    Pure computation for preview, no DB access.
+
+    - If mode="qty": treat `amount` as a quantity; round to nearest int and clamp to >= 0.
+    - If mode="usdc": treat `amount` as USDC; derive quantity via qty_from_buy_usdc / qty_from_sell_usdc.
+    """
+    side = (side or "").strip().lower()
+    mode = (mode or "").strip().lower()
+    if side not in ("buy", "sell"):
+        raise ValueError("side must be 'buy' or 'sell'")
+    if mode not in ("qty", "usdc"):
+        raise ValueError("mode must be 'qty' or 'usdc'")
+
+    if mode == "qty":
+        q = int(max(0, round(float(amount or 0.0))))
+    else:  # mode == "usdc"
+        usd = float(amount or 0.0)
+        q = qty_from_buy_usdc(reserve, usd) if side == "buy" else qty_from_sell_usdc(reserve, usd)
+
+    # Core preview math (existing semantics)
+    buy_price, sell_price, buy_amt, sell_amt, tax_used = metrics_from_qty(reserve, q)
+
+    # Prospective reserve after the action
+    new_reserve = reserve + q if side == "buy" else max(0, reserve - min(q, reserve))
+
+    return {
+        "quantity": int(q),
+        "new_reserve": int(new_reserve),
+        "buy_price": float(buy_price),
+        "sell_price_marginal_net": float(sell_price),
+        "buy_amt_delta": float(buy_amt),
+        "sell_amt_delta": float(sell_amt),
+        "sell_tax_rate_used": float(tax_used),
+    }
+
 
 # ---- Points + Leaderboard helpers (same math as app) ----
 def compute_user_points(db: Session):

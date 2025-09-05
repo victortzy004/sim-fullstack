@@ -19,7 +19,8 @@ from dotenv import load_dotenv
 
 # ROOT = Path(__file__).resolve().parents[1]
 # load_dotenv(ROOT / ".env")   # make variables visible to os.getenv
-BASE = "http://concept.alkimiya.io/simpi"
+# BASE = "http://concept.alkimiya.io/simpi"
+BASE = "http://localhost:8000/"
 
 
 st.caption(f"API_BASE_URL: {BASE}")
@@ -1151,6 +1152,7 @@ for i, token in enumerate(TOKENS):
                     # check balance
                     payload = {
                         "user_id": st.session_state.user_id,
+                        "market_id": MARKET_ID,
                         "token": token,
                         "side": "buy",   # or "sell"
                         "mode": "qty" if input_mode == "Quantity" else "usdc",
@@ -1177,6 +1179,7 @@ for i, token in enumerate(TOKENS):
                 else:
                     payload = {
                         "user_id": st.session_state.user_id,
+                        "market_id": MARKET_ID,
                         "token": token,
                         "side": "sell",   # or "sell"
                         "mode": "qty" if input_mode == "Quantity" else "usdc",

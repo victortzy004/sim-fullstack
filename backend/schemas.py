@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Optional, List, Literal
 
 class HealthOut(BaseModel):
@@ -43,6 +43,14 @@ class AdminResolveRequest(BaseModel):
     password: str = Field(..., min_length=1, description="Admin password")
     winner_token: str = Field(..., description="Winning outcome token")
 
+# --- Admin-related ----
+class AdminConfigureMarketRequest(BaseModel):
+    password: str
+    question: str | None = None
+    resolution_note: str | None = None
+    tokens: list[str] | None = None  # canonical outcomes list (order matters)
+
+
 class ReserveOut(BaseModel):
     market_id: int
     token: str
@@ -57,19 +65,33 @@ class MarketOut(BaseModel):
     winner_token: Optional[str]
     resolved: int
     resolved_ts: Optional[str]
+    question: str
+    resolution_note: str
+    outcomes: List[str] = Field(default_factory=list)
+
     model_config = ConfigDict(from_attributes=True)
 
-class MarketWithReservesOut(MarketOut):
-    reserves: List[ReserveOut] = []
 
+class OutcomeOut(BaseModel):
+    token: str
+    display: str | None = None
+    sort_order: int
+    class Config: from_attributes = True
+
+class MarketWithReservesOut(MarketOut):
+    outcomes: List[OutcomeOut] = Field(default_factory=list)
+    reserves: List['ReserveOut'] = Field(default_factory=list)
 
 class HoldingOut(BaseModel):
     user_id: int
+    market_id: int
     token: str
     shares: int
+    class Config: from_attributes = True
 
 class TxOut(BaseModel):
     id: int
+    market_id: int
     ts: str
     user_id: int
     user_name: str
@@ -85,6 +107,7 @@ class TxOut(BaseModel):
 
 class TradeIn(BaseModel):
     user_id: int
+    market_id: int
     token: str
     mode: str  # "qty" or "usdc"
     amount: float  # qty (int-ish) if mode=qty, otherwise USDC
@@ -104,9 +127,25 @@ class PointsTimelineRow(BaseModel):
     total_points: float
 
 
+
 # ---- Preview Schemas ----
 class PreviewRequest(BaseModel):
-    quantity: int
+    # trade-style inputs
+    side: Literal["buy", "sell"] = "buy"
+    mode: Literal["qty", "usdc"] = "qty"
+    # When mode="qty", interpret `amount` as a quantity (round to nearest int).
+    # When mode="usdc", interpret `amount` as USDC.
+    amount: Optional[float] = None
+
+    @model_validator(mode="after")
+    def _validate_amount(self):
+        if self.amount is None:
+            raise ValueError("amount is required")
+        if self.mode == "usdc" and float(self.amount) <= 0:
+            raise ValueError("amount must be > 0 when mode='usdc'")
+        if self.mode == "qty" and float(self.amount) < 0:
+            raise ValueError("amount (quantity) must be >= 0 when mode='qty'")
+        return self
 
 class PreviewResponse(BaseModel):
     market_id: int
