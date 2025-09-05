@@ -71,7 +71,6 @@ class MarketOut(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-
 class OutcomeOut(BaseModel):
     token: str
     display: str | None = None
@@ -112,6 +111,21 @@ class TradeIn(BaseModel):
     mode: str  # "qty" or "usdc"
     amount: float  # qty (int-ish) if mode=qty, otherwise USDC
     side: str  # "buy" or "sell"
+
+# For Outcome token ownership breakdown
+class OwnershipHolder(BaseModel):
+    user_id: int
+    username: str
+    shares: int
+    share_pct: float  # 0..1 fraction of total outstanding for this token in this market
+    model_config = ConfigDict(from_attributes=True)
+
+class OwnershipBreakdownOut(BaseModel):
+    market_id: int
+    token: str
+    total_shares: int
+    holders: List[OwnershipHolder] = Field(default_factory=list)
+    model_config = ConfigDict(from_attributes=True)
 
 class LeaderboardRow(BaseModel):
     user: str

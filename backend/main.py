@@ -10,7 +10,7 @@ from dotenv import load_dotenv, find_dotenv
 from .db import Base, engine, get_db
 from .models import User, Market, Reserve, Holding, Tx, MarketOutcome
 from .schemas import *
-from .logic import do_trade, compute_user_points, is_market_active, preview_for_side_mode, list_market_outcomes, STARTING_BALANCE, MARKET_DURATION_DAYS, TOKENS
+from .logic import do_trade, compute_user_points, is_market_active, ownership_breakdown, preview_for_side_mode, list_market_outcomes, STARTING_BALANCE, MARKET_DURATION_DAYS, TOKENS
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -38,8 +38,6 @@ def _assert_admin(pw: str):
 def _now_iso():
     # no timezone suffix, matches _parse_ts above
     return datetime.utcnow().replace(microsecond=0).isoformat()
-
-
 
 
 
@@ -99,6 +97,7 @@ def _market_to_out(db: Session, m: Market) -> MarketOut:
                    .order_by(MarketOutcome.sort_order.asc(), MarketOutcome.token.asc())
                    .all()
     ]
+    
     return MarketOut(
         id=m.id,
         start_ts=m.start_ts,
@@ -512,6 +511,39 @@ def get_market(market_id: int, db: Session = Depends(get_db)):
         ],
         reserves=reserves,
     )
+
+# Token user ownership breakdown
+@app.get(
+    "/market/{market_id}/ownership/{token}",
+    response_model=OwnershipBreakdownOut,
+    tags=["Market"],
+    summary="Ownership breakdown for a market outcome",
+    description="Returns holders (user_id, username, shares, share_pct) for the given market and token.",
+)
+def get_ownership_breakdown(
+    market_id: int,
+    token: str,
+    min_shares: int = Query(1, ge=0, description="Minimum shares to be included (default 1, set 0 to include all)"),
+    limit: Optional[int] = Query(None, ge=1, le=10000, description="Optional top-N holders"),
+    order: Literal["desc", "asc"] = Query("desc", description="Sort by shares"),
+    db: Session = Depends(get_db),
+):
+    token = token.strip().upper()
+
+    # Validate token here to return a proper HTTP 400
+    valid = list_market_outcomes(db, market_id)
+    if token not in valid:
+        raise HTTPException(status_code=400, detail=f"Invalid token for market {market_id}. Valid: {valid}")
+
+    data = ownership_breakdown(
+        db, market_id, token,
+        min_shares=min_shares,
+        limit=limit,
+        order=order,
+    )
+
+    # The logic() returns a plain dict; it already matches the response model shape.
+    return data
 
 
 # ====== User Holdings ======
