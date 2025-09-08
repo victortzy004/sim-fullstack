@@ -1,6 +1,6 @@
 # file: app.py
 import streamlit as st
-from datetime import datetime, timedelta
+from datetime import datetime 
 import pandas as pd
 import numpy as np
 import math
@@ -8,7 +8,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 from concurrent.futures import ThreadPoolExecutor
-from typing import Tuple, Dict, List
+from typing import Dict, List
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -32,7 +32,7 @@ st.caption(f"API_BASE_URL: {BASE}")
 DEFAULT_DECIMAL_PRECISION = 2
 BASE_EPSILON = 1e-4
 MARKET_DURATION_DAYS = 5
-END_TS = "2025-09-07 00:00"
+END_TS = "2025-09-15 00:00"
 MAX_SHARES = 5000000 #10M
 STARTING_BALANCE = 10000.0
 BINARY_OUTCOME_TOKENS = ["YES", "NO"]
@@ -86,6 +86,8 @@ def _get(path: str, timeout: float = 5.0, session: requests.Session | None = Non
     r.raise_for_status()
     return r.json()
 
+
+# Cache snapshot
 @st.cache_data(ttl=5, show_spinner=False)
 def fetch_snapshot(market_id: int, user_id: int | None, version: int = 0):
     s = http_session()
@@ -631,6 +633,8 @@ winner_token = m.get('winner_token')
 resolved_flag = int(m.get("resolved") or 0)
 resolved_ts = m.get('resolved_ts')
 
+
+
 # Winner banner (now safe)
 if resolved_flag == 1 and m.get("winner_token"):
     st.success(f"✅ Resolved — Winner: {m['winner_token']}")
@@ -761,6 +765,13 @@ if "user_id" in st.session_state and st.session_state.get("username") == "admin"
                         f"Market resolved. Winner: {winner}. "
                         f"Payout pool: ${float(resp.get('payout_pool', 0.0)):,.2f}"
                     )
+
+                    # 2) Bump your per-session cache key (guarantees fresh fetch on rerun)
+                    st.session_state["snap_version"] = st.session_state.get("snap_version", 0) + 1
+
+                    # (Optional) keep a note of when we resolved to avoid duplicate bumps
+                    st.session_state["_last_resolved_ts"] = resp.get("resolved_ts")
+                    # Rerun
                     st.rerun()
                 except APIError as e:
                     st.error(str(e))
@@ -791,6 +802,7 @@ if "user_id" in st.session_state and st.session_state.get("username") == "admin"
  
 now = datetime.utcnow()
 hard_end = datetime.fromisoformat(END_TS)   # <-- enforce constant cutoff
+
 
 # Market is active only if:
 # 1) within DB market window
@@ -1415,7 +1427,7 @@ def get_curve_series(max_shares: int, reserve: int, dense_pts: int = 1500, spars
 # ---------------------------
 # API fetchers
 # ---------------------------
-@st.cache_data(show_spinner=False, ttl=3)
+@st.cache_data(show_spinner=False, ttl=2)
 def fetch_market_with_reserves(market_id: int) -> dict:
     # assuming api_get joins base+path internally or accepts absolute paths
     return api_get(f"/market/{market_id}", timeout=10)

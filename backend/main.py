@@ -130,7 +130,7 @@ def startup():
         m = db.get(Market, 1)
         if not m:
             now_dt = datetime.utcnow().replace(microsecond=0)
-            end_dt = now_dt + timedelta(days=5)
+            end_dt = now_dt + timedelta(days=20)
             db.add(Market(
                 id=1,
                 start_ts=now_dt.isoformat(),
@@ -254,6 +254,47 @@ def join_or_load_user(payload: UserCreate, db: Session = Depends(get_db)):
 
 # ====== Admin ======
 # Start new market
+# @app.post("/admin/{market_id}/start", response_model=MarketOut,
+#           tags=["Admin"], summary="Start market",
+#           description="Starts a market. Requires admin password in body.")
+# def admin_start(
+#     market_id: int,
+#     req: AdminStartRequest = Body(...),
+#     db: Session = Depends(get_db),
+# ):
+#     _assert_admin(req.password)
+
+#     now = _now_iso()
+#     end = (datetime.utcnow() + timedelta(days=req.duration_days or MARKET_DURATION_DAYS))\
+#             .replace(microsecond=0).isoformat()
+
+#     m = db.get(Market, market_id)
+#     if not m:
+#         m = Market(id=market_id, start_ts=now, end_ts=end, winner_token=None, resolved=0, resolved_ts=None)
+#         db.add(m)
+#     else:
+#         if is_market_active(m):
+#             raise HTTPException(status_code=400, detail="Market already active.")
+#         m.start_ts = now
+#         m.end_ts = end
+#         m.winner_token = None
+#         m.resolved = 0
+#         m.resolved_ts = None
+
+#     # Ensure reserves for THIS market
+#     for t in TOKENS:
+#         r = db.query(Reserve).filter(Reserve.market_id == market_id, Reserve.token == t).first()
+#         if not r:
+#             db.add(Reserve(market_id=market_id, token=t, shares=0, usdc=0.0))
+#         elif req.reset_reserves:
+#             r.shares = 0
+#             r.usdc = 0.0
+
+#     db.commit()
+#     db.refresh(m)
+#     return _market_to_out(db, m)
+
+
 @app.post("/admin/{market_id}/start", response_model=MarketOut,
           tags=["Admin"], summary="Start market",
           description="Starts a market. Requires admin password in body.")
@@ -264,14 +305,33 @@ def admin_start(
 ):
     _assert_admin(req.password)
 
+    # normalize/validate outcomes
+    if req.outcomes and len(req.outcomes) > 0:
+        desired_outcomes = [t.strip().upper() for t in req.outcomes if t and t.strip()]
+        desired_outcomes = list(dict.fromkeys(desired_outcomes))  # unique, keep order
+        if len(desired_outcomes) == 0:
+            raise HTTPException(status_code=400, detail="At least one outcome required")
+    else:
+        desired_outcomes = None  # means: keep existing if any, else use DEFAULT_OUTCOMES
+
     now = _now_iso()
     end = (datetime.utcnow() + timedelta(days=req.duration_days or MARKET_DURATION_DAYS))\
             .replace(microsecond=0).isoformat()
 
     m = db.get(Market, market_id)
     if not m:
-        m = Market(id=market_id, start_ts=now, end_ts=end, winner_token=None, resolved=0, resolved_ts=None)
+        m = Market(
+            id=market_id,
+            start_ts=now,
+            end_ts=end,
+            winner_token=None,
+            resolved=0,
+            resolved_ts=None,
+            question=req.question,
+            resolution_note=req.resolution_note,
+        )
         db.add(m)
+        db.flush()  # ensure m.id exists for reserves
     else:
         if is_market_active(m):
             raise HTTPException(status_code=400, detail="Market already active.")
@@ -280,20 +340,45 @@ def admin_start(
         m.winner_token = None
         m.resolved = 0
         m.resolved_ts = None
+        # update meta if provided (leave unchanged if omitted)
+        if req.question is not None:
+            m.question = req.question
+        if req.resolution_note is not None:
+            m.resolution_note = req.resolution_note
 
-    # Ensure reserves for THIS market
-    for t in TOKENS:
-        r = db.query(Reserve).filter(Reserve.market_id == market_id, Reserve.token == t).first()
-        if not r:
+    # Work out the *final* outcome list to enforce in reserves
+    existing_tokens = {
+        r.token for r in db.query(Reserve).filter(Reserve.market_id == market_id).all()
+    }
+    if desired_outcomes is None:
+        desired = list(existing_tokens) if existing_tokens else list(DEFAULT_OUTCOMES)
+    else:
+        desired = desired_outcomes
+
+    desired_set = set(desired)
+
+    # Add missing reserves for desired outcomes
+    for t in desired:
+        if t not in existing_tokens:
             db.add(Reserve(market_id=market_id, token=t, shares=0, usdc=0.0))
-        elif req.reset_reserves:
-            r.shares = 0
-            r.usdc = 0.0
+
+    # Remove reserves that are no longer desired (safe here because we are starting a new market)
+    for t in (existing_tokens - desired_set):
+        db.query(Reserve).filter(
+            Reserve.market_id == market_id,
+            Reserve.token == t
+        ).delete(synchronize_session=False)
+
+    # Optionally reset reserves
+    if req.reset_reserves:
+        db.query(Reserve).filter(Reserve.market_id == market_id).update(
+            {Reserve.shares: 0, Reserve.usdc: 0.0},
+            synchronize_session=False
+        )
 
     db.commit()
     db.refresh(m)
     return _market_to_out(db, m)
-
 
 # Admin market reset (makes market active)
 @app.post(

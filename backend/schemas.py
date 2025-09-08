@@ -33,6 +33,13 @@ class StartRequest(BaseModel):
 # Extends your StartRequest (adds 'password')
 class AdminStartRequest(StartRequest):
     password: str = Field(..., min_length=1, description="Admin password")
+    duration_days: Optional[int] = None
+    reset_reserves: bool = False
+
+    # NEW (all optional)
+    question: Optional[str] = None
+    resolution_note: Optional[str] = None
+    outcomes: Optional[List[str]] = None  # e.g. ["YES","NO"]
 
 # Extends your ResetRequest (adds 'password')
 class AdminResetRequest(ResetRequest):
