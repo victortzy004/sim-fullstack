@@ -14,9 +14,9 @@ from .logic import do_trade, compute_user_points, is_market_active, ownership_br
 
 from fastapi.middleware.cors import CORSMiddleware
 
-DEFAULT_QUESTION = "Price of Ethereum greater than $4500 by 7th Sept?"
+DEFAULT_QUESTION = "Price of Ethereum by 15th Sept?"
 DEFAULT_RES_NOTE = ("This market will resolve according to the price chart of the "
-                    "Binance Spot Market ETH/USDT until the end of deadline (7th Sept 12:00 UTC).")
+                    "Binance Spot Market ETH/USDT until the end of deadline (15th Sept 12:00 UTC).")
 DEFAULT_OUTCOMES = ["YES", "NO"]  # or your 3 buckets
 
 # Load .env file for root path
@@ -130,7 +130,8 @@ def startup():
         m = db.get(Market, 1)
         if not m:
             now_dt = datetime.utcnow().replace(microsecond=0)
-            end_dt = now_dt + timedelta(days=20)
+            # end_dt = now_dt + timedelta(days=20)
+            end_dt = datetime(2025, 9, 15, 0, 0)  # ← Sept 15 @ 00:00 (UTC, naive)
             db.add(Market(
                 id=1,
                 start_ts=now_dt.isoformat(),

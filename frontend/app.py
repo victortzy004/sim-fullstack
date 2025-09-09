@@ -1,6 +1,6 @@
 # file: app.py
 import streamlit as st
-from datetime import datetime 
+from datetime import datetime, date
 import pandas as pd
 import numpy as np
 import math
@@ -39,11 +39,17 @@ BINARY_OUTCOME_TOKENS = ["YES", "NO"]
 
 MARKET_ID = 1
 
-MARKET_QUESTION = "Price of Ethereum greater than $4500 by 7th Sept?"
+MARKET_QUESTION = "Will MicroStrategy purchase Bitcoin September 9-15?"
+START_DATE = date(2025, 9, 9)   # change as needed
+END_DATE   = date(2025, 9, 15)
 RESOLUTION_NOTE = (
-    'This market will resolve according to the price chart of the '
-    'Binance Spot Market ETH/USDT until the end of deadline (7th Sept 12:00 UTC).'
+    f'This market will resolve to "Yes" if MicroStrategy Incorporated announces that they have acquired '
+    f'additional Bitcoin between 12:00 AM ET on {START_DATE:%B} {START_DATE.day}, {START_DATE.year} '
+    f'and 11:59 PM ET on {END_DATE:%B} {END_DATE.day}, {END_DATE.year}. '
+    f'Otherwise, it will resolve to "No". '
+    f'Resolution will be based on official information from MicroStrategy or Michael Saylor. '
 )
+# TOKENS = ["YES", "NO"]
 # TOKENS = ["<4500", "4300-4700", ">4700"]
 TOKENS = BINARY_OUTCOME_TOKENS
 
@@ -873,7 +879,7 @@ else:
             </p>
             <h5>🔗 Resolution Sources/Resources:</h5>
             <ul>
-                    <li><a href="https://www.binance.com/en/trade/ETH_USDT?type=spot/" target="_blank">Binance International: ETH/USDT Spot Market</a></li>
+                   <li><a href="https://www.strategy.com/purchases" target="_blank">MicroStrategy Purchases</a></li>
             </ul>
         </div>
         """,
