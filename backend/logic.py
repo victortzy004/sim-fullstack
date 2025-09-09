@@ -13,7 +13,7 @@ from .models import User, Market, Reserve, Holding, Tx, MarketOutcome
 # ---- Constants (match your Streamlit app) ----
 BASE_EPSILON = 1e-4
 MARKET_DURATION_DAYS = 5
-END_TS = "2025-08-24 00:00"
+END_TS = "2025-08-15 00:00"
 STARTING_BALANCE = 10000.0
 TOKENS = ["YES", "NO"]
 MAX_SHARES = 5000000 #5M

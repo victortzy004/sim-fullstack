@@ -111,18 +111,6 @@ def _market_to_out(db: Session, m: Market) -> MarketOut:
     )
 
 
-
-def ensure_bootstrap(db: Session):
-    market = db.query(Market).get(1)
-    if not market:
-        market = Market(id=1, start_ts=..., end_ts=...)
-        db.add(market)
-    for t in TOKENS:
-        if not db.query(Reserve).filter_by(market_id=1, token=t).first():
-            db.add(Reserve(market_id=1, token=t, shares=0, usdc=0.0))
-    db.commit()
-
-
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(bind=engine)
@@ -394,9 +382,15 @@ def admin_reset(
     db: Session = Depends(get_db),
 ):
     _assert_admin(req.password)
+    
 
     now_iso = _now_iso()
-    end_iso = (datetime.utcnow() + timedelta(days=MARKET_DURATION_DAYS)).replace(microsecond=0).isoformat()
+    now = datetime.utcnow().replace(microsecond=0)
+    target = datetime(now.year, 9, 15, 0, 0, 0)
+    if now >= target:
+        end_iso = (datetime.utcnow() + timedelta(days=MARKET_DURATION_DAYS)).replace(microsecond=0).isoformat()
+    else:
+        end_iso = target.replace(microsecond=0).isoformat()
 
     # Upsert + mark ACTIVE
     m = db.get(Market, market_id)

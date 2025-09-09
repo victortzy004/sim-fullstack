@@ -1070,7 +1070,7 @@ if user_id is not None:
 
     pnl_df = pd.DataFrame(pnl_rows)
     st.markdown("**Per-Token Position & PnL**")
-    st.dataframe(pnl_df, use_container_width=True)
+    st.dataframe(pnl_df, width='stretch')
     st.divider()
 
 
@@ -1333,7 +1333,7 @@ if tx.empty:
     st.info("No transactions yet to compute history.")
 else:
     st.subheader("Transaction Log")
-    st.dataframe(tx_display, use_container_width=True)
+    st.dataframe(tx_display, width='stretch')
     st.divider()
 
     # 📈 Payout/Share Trend (reconstructed)
@@ -1375,7 +1375,7 @@ else:
             ps_df, x="Time", y="Payout/Share", color="Outcome", markers=True,
             title="Payout/Share Over Time"
         )
-        st.plotly_chart(fig, use_container_width=True, key="chart_payout_share")
+        st.plotly_chart(fig, width='stretch', key="chart_payout_share")
         st.divider()
 
 # ===========================================================
@@ -1514,7 +1514,7 @@ for token, token_tab in zip(TOKENS, token_tabs):
                 yaxis_title='Price',
                 hovermode="x unified",
             )
-            st.plotly_chart(fig_curve, use_container_width=True, key=f"chart_curve_{token}")
+            st.plotly_chart(fig_curve, width='stretch', key=f"chart_curve_{token}")
 
         elif view == "Sell Spread":
             if reserve <= 0:
@@ -1537,7 +1537,7 @@ for token, token_tab in zip(TOKENS, token_tabs):
                     yaxis_title='Tax Rate',
                     hovermode="x unified"
                 )
-                st.plotly_chart(fig_tax, use_container_width=True, key=f"sale_tax_curve_{token}")
+                st.plotly_chart(fig_tax, width='stretch', key=f"sale_tax_curve_{token}")
 
         else:  # "Effective Sell (Net)"
             C = reserve
@@ -1568,7 +1568,7 @@ for token, token_tab in zip(TOKENS, token_tabs):
                     yaxis_title='Avg Net Sell Price (USDC/share)',
                     hovermode="x unified"
                 )
-                st.plotly_chart(fig_eff, use_container_width=True, key=f"effective_sell_{token}")
+                st.plotly_chart(fig_eff, width='stretch', key=f"effective_sell_{token}")
 
 
  # ===========================================================
@@ -1662,7 +1662,7 @@ else:
             port_df, x="Time", y="PortfolioValue", color="User",
             title=f"Portfolio Value Over Time (Buy Price)"
         )
-        st.plotly_chart(fig_port, use_container_width=True, key="portfolio_value_chart")
+        st.plotly_chart(fig_port, width='stretch', key="portfolio_value_chart")
 
     with tab2:
         # ---- Points chart ----
@@ -1682,7 +1682,7 @@ else:
                 title="Total Points Over Time (Cumulative Volume + Instant PnL Points)",
                 line_group="User",
             )
-            st.plotly_chart(fig_pts, use_container_width=True, key='points_chart')
+            st.plotly_chart(fig_pts, width='stretch', key='points_chart')
 
  # ===========================================================
 # Historical portfolio visualization (toggle between buy and sell price)
@@ -1841,6 +1841,6 @@ if not txp.empty:
 
             st.dataframe(
                 latest[["User", "Payout", "PortfolioValue", "PnL", "VolumePoints", "PnLPoints", "TotalPoints"]],
-                use_container_width=True
+                width='stretch'
             )
 
