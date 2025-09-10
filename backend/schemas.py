@@ -1,5 +1,5 @@
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Dict
 
 class HealthOut(BaseModel):
     status: Literal["ok"]
@@ -8,6 +8,16 @@ class StartRequest(BaseModel):
     duration_days: Optional[int] = None     # default to MARKET_DURATION_DAYS if None
     reset_reserves: bool = False            # optionally zero reserves on start
 
+class HoldingOut(BaseModel):
+    user_id: int
+    market_id: int
+    token: str
+    shares: int
+    price: float = 0.0
+    value: float = 0.0
+    model_config = ConfigDict(from_attributes=True)
+
+
 class UserCreate(BaseModel):
     username: str
     
@@ -15,7 +25,10 @@ class UserOut(BaseModel):
     id: int
     username: str
     balance: float
-    class Config: from_attributes = True
+    holdings: List[HoldingOut] = []          # NEW: embed full rows
+    # (optional convenience: map of token->shares)
+    holdings_by_token: Dict[str, int] = {}   # NEW: handy for UIs
+    model_config = ConfigDict(from_attributes=True)
 
 class UserWithPointsOut(UserOut):
     volume_points: float
@@ -88,12 +101,7 @@ class MarketWithReservesOut(MarketOut):
     outcomes: List[OutcomeOut] = Field(default_factory=list)
     reserves: List['ReserveOut'] = Field(default_factory=list)
 
-class HoldingOut(BaseModel):
-    user_id: int
-    market_id: int
-    token: str
-    shares: int
-    class Config: from_attributes = True
+
 
 class TxOut(BaseModel):
     id: int

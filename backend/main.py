@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, Body, status, Path, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, select
 from typing import List, Annotated
 from datetime import datetime, timedelta
 import secrets, os
@@ -10,7 +10,7 @@ from dotenv import load_dotenv, find_dotenv
 from .db import Base, engine, get_db
 from .models import User, Market, Reserve, Holding, Tx, MarketOutcome
 from .schemas import *
-from .logic import do_trade, compute_user_points, is_market_active, ownership_breakdown, preview_for_side_mode, list_market_outcomes, STARTING_BALANCE, MARKET_DURATION_DAYS, TOKENS
+from .logic import do_trade, buy_curve, compute_user_points, is_market_active, ownership_breakdown, preview_for_side_mode, list_market_outcomes, STARTING_BALANCE, MARKET_DURATION_DAYS, TOKENS
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -111,6 +111,75 @@ def _market_to_out(db: Session, m: Market) -> MarketOut:
     )
 
 
+# ====== Helper Functions ======
+def _user_out_by_filter(
+    db: Session,
+    *,
+    user_id: int | None = None,
+    username: str | None = None,
+    market_id: int | None = None,
+) -> UserOut:
+    # Find the user by id or username (exactly one must be provided)
+    if (user_id is None) == (username is None):
+        raise HTTPException(status_code=400, detail="Provide exactly one of user_id or username")
+
+    if user_id is not None:
+        user = db.get(User, user_id)
+    else:
+        user = (
+            db.query(User)
+              .filter(func.lower(User.username) == func.lower(username.strip()))
+              .first()
+        )
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Load holdings (optionally filter by market)
+    q = db.query(Holding).filter(Holding.user_id == user.id)
+    if market_id is not None:
+        q = q.filter(Holding.market_id == market_id)
+    holdings_rows = q.order_by(Holding.token.asc()).all()
+
+    # Prefetch reserves for (market_id, token) pairs to price holdings at current buy-curve spot
+    m_ids = {h.market_id for h in holdings_rows if h.market_id is not None}
+    toks  = {h.token for h in holdings_rows}
+    res_map: dict[tuple[int, str], int] = {}
+    if m_ids and toks:
+        reserves = (
+            db.query(Reserve)
+              .filter(Reserve.market_id.in_(m_ids), Reserve.token.in_(toks))
+              .all()
+        )
+        res_map = {(r.market_id, r.token): int(r.shares or 0) for r in reserves}
+
+    # Build enriched holdings
+    out_holdings: list[HoldingOut] = []
+    for h in holdings_rows:
+        key = (h.market_id, h.token) if h.market_id is not None else None
+        reserve_shares = res_map.get(key, 0) if key else 0
+        price_now = float(buy_curve(reserve_shares))
+        out_holdings.append(
+            HoldingOut(
+                user_id=h.user_id,
+                market_id=h.market_id,
+                token=h.token,
+                shares=int(h.shares or 0),
+                # use field names your schema expects:
+                price=price_now,
+                value=price_now * int(h.shares or 0),
+            )
+        )
+
+    return UserOut(
+        id=user.id,
+        username=user.username,
+        balance=user.balance,
+        holdings=out_holdings,
+        holdings_by_token={h.token: int(h.shares or 0) for h in holdings_rows},
+    )
+
+
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(bind=engine)
@@ -171,11 +240,13 @@ def list_users(db: Session = Depends(get_db)):
     summary="Get user by ID",
     description="Returns the user by ID."
 )
-def get_user(user_id: int, db: Session = Depends(get_db)):
-    user = db.get(User, user_id)  # or: db.query(User).get(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="Not Found")
-    return UserOut(id=user.id, username=user.username, balance=user.balance)
+def get_user(
+    user_id: int,
+    market_id: Annotated[int | None, Query(ge=1, description="Optional market filter")] = None,
+    db: Session = Depends(get_db),
+):
+    return _user_out_by_filter(db, user_id=user_id, market_id=market_id)
+
 
 # Fetch user data by username (unchanged)
 @app.get(
@@ -185,17 +256,12 @@ def get_user(user_id: int, db: Session = Depends(get_db)):
     summary="Get user by username"
 )
 def get_user_by_username(
-    username: str = Path(..., min_length=1),
+    username: Annotated[str, Path(..., min_length=1)],
+    market_id: Annotated[int | None, Query(ge=1)] = None,
     db: Session = Depends(get_db),
 ):
-    u = (
-        db.query(User)
-        .filter(func.lower(User.username) == func.lower(username.strip()))
-        .first()
-    )
-    if not u:
-        raise HTTPException(status_code=404, detail="User not found")
-    return UserOut(id=u.id, username=u.username, balance=u.balance)
+    return _user_out_by_filter(db, username=username, market_id=market_id)
+
 
 # @app.get("/users/with-points", response_model=List[UserWithPointsOut])
 # def list_users_with_points(db: Session = Depends(get_db)):
@@ -293,6 +359,32 @@ def admin_start(
     db: Session = Depends(get_db),
 ):
     _assert_admin(req.password)
+    
+    # ---- 1) Read requested outcomes (support legacy "tokens")
+    requested = None
+    if getattr(req, "outcomes", None):
+        requested = req.outcomes
+    elif getattr(req, "tokens", None):
+        requested = req.tokens
+
+
+    if requested:
+        # trim & keep order unique
+        desired = []
+        seen = set()
+        for t in requested:
+            if not t:
+                continue
+            tok = t.strip()
+            if not tok:
+                continue
+            if tok not in seen:
+                desired.append(tok)   # keep exact case for display
+                seen.add(tok)
+        if not desired:
+            raise HTTPException(400, detail="At least one outcome required.")
+    else:
+        desired = None  # decide below
 
     # normalize/validate outcomes
     if req.outcomes and len(req.outcomes) > 0:
@@ -335,30 +427,58 @@ def admin_start(
         if req.resolution_note is not None:
             m.resolution_note = req.resolution_note
 
-    # Work out the *final* outcome list to enforce in reserves
-    existing_tokens = {
-        r.token for r in db.query(Reserve).filter(Reserve.market_id == market_id).all()
-    }
-    if desired_outcomes is None:
-        desired = list(existing_tokens) if existing_tokens else list(DEFAULT_OUTCOMES)
-    else:
-        desired = desired_outcomes
+ # ---- determine final desired outcome list
+    # first, see what we already have in MarketOutcome for this market
+    existing_mo = db.execute(
+        select(MarketOutcome).where(MarketOutcome.market_id == market_id)
+    ).scalars().all()
+    existing_tokens = [mo.token for mo in existing_mo]
+
+    if desired is None:
+        desired = existing_tokens if existing_tokens else list(DEFAULT_OUTCOMES)
 
     desired_set = set(desired)
+    existing_set = set(existing_tokens)
 
-    # Add missing reserves for desired outcomes
-    for t in desired:
-        if t not in existing_tokens:
-            db.add(Reserve(market_id=market_id, token=t, shares=0, usdc=0.0))
-
-    # Remove reserves that are no longer desired (safe here because we are starting a new market)
-    for t in (existing_tokens - desired_set):
+    # ---- delete outcomes that are no longer desired
+    for tok in (existing_set - desired_set):
+        db.query(MarketOutcome).filter(
+            MarketOutcome.market_id == market_id,
+            MarketOutcome.token == tok
+        ).delete(synchronize_session=False)
+        # keep or delete reserves for removed tokens; since we’re “starting” a market, safe to remove:
         db.query(Reserve).filter(
             Reserve.market_id == market_id,
-            Reserve.token == t
+            Reserve.token == tok
         ).delete(synchronize_session=False)
 
-    # Optionally reset reserves
+    # ---- insert/update desired outcomes (preserve order via sort_order)
+    for i, tok in enumerate(desired):
+        mo = db.query(MarketOutcome).filter(
+            MarketOutcome.market_id == market_id,
+            MarketOutcome.token == tok
+        ).first()
+        if not mo:
+            db.add(MarketOutcome(
+                market_id=market_id,
+                token=tok,
+                display=tok,      # or req-provided display if you add it
+                sort_order=i
+            ))
+        else:
+            mo.sort_order = i
+            # optionally update display name:
+            # mo.display = tok
+
+    # ---- ensure reserves exist for each desired token (and only those)
+    for tok in desired:
+        r = db.query(Reserve).filter(
+            Reserve.market_id == market_id,
+            Reserve.token == tok
+        ).first()
+        if not r:
+            db.add(Reserve(market_id=market_id, token=tok, shares=0, usdc=0.0))
+
     if req.reset_reserves:
         db.query(Reserve).filter(Reserve.market_id == market_id).update(
             {Reserve.shares: 0, Reserve.usdc: 0.0},
@@ -368,6 +488,40 @@ def admin_start(
     db.commit()
     db.refresh(m)
     return _market_to_out(db, m)
+
+    # # Work out the *final* outcome list to enforce in reserves
+    # existing_tokens = {
+    #     r.token for r in db.query(Reserve).filter(Reserve.market_id == market_id).all()
+    # }
+    # if desired_outcomes is None:
+    #     desired = list(existing_tokens) if existing_tokens else list(DEFAULT_OUTCOMES)
+    # else:
+    #     desired = desired_outcomes
+
+    # desired_set = set(desired)
+
+    # # Add missing reserves for desired outcomes
+    # for t in desired:
+    #     if t not in existing_tokens:
+    #         db.add(Reserve(market_id=market_id, token=t, shares=0, usdc=0.0))
+
+    # # Remove reserves that are no longer desired (safe here because we are starting a new market)
+    # for t in (existing_tokens - desired_set):
+    #     db.query(Reserve).filter(
+    #         Reserve.market_id == market_id,
+    #         Reserve.token == t
+    #     ).delete(synchronize_session=False)
+
+    # # Optionally reset reserves
+    # if req.reset_reserves:
+    #     db.query(Reserve).filter(Reserve.market_id == market_id).update(
+    #         {Reserve.shares: 0, Reserve.usdc: 0.0},
+    #         synchronize_session=False
+    #     )
+
+    # db.commit()
+    # db.refresh(m)
+    # return _market_to_out(db, m)
 
 # Admin market reset (makes market active)
 @app.post(

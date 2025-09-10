@@ -243,6 +243,12 @@ def ensure_user_holdings_for_market(db: Session, user_id: int, market_id: int):
             db.add(Holding(user_id=user_id, market_id=market_id, token=token, shares=0))
     db.flush
 
+def _allowed_tokens_for_market(db: Session, market_id: int) -> set[str]:
+    rows = db.execute(
+        select(func.upper(MarketOutcome.token)).where(MarketOutcome.market_id == market_id)
+    ).scalars().all()
+    return set(rows)
+
 # ---- Trading endpoints logic ----
 def do_trade(db: Session, user_id: int, token: str, market_id: int, side: str, mode: str, amount: float):
     # 0) Market must be active (single source of truth)
@@ -255,10 +261,17 @@ def do_trade(db: Session, user_id: int, token: str, market_id: int, side: str, m
     # ensure_user_holdings_for_market(db, user_id, market_id)
 
     # 1) Basic input validation
-    if token not in TOKENS:
-        raise ValueError("Invalid token.")
+    # normalize token and validate against THIS market's outcomes
+    tok = (token or "").strip().upper()
     side = side.lower().strip()
     mode = mode.lower().strip()
+
+    allowed = _allowed_tokens_for_market(db, market_id)
+    if not allowed:
+        raise ValueError("Market has no configured outcome tokens.")
+    if tok not in allowed:
+        raise ValueError(f"Invalid token for market {market_id}. Allowed: {sorted(allowed)}")
+
     if side not in ("buy", "sell"):
         raise ValueError("Invalid side.")
     if mode not in ("qty", "usdc"):
