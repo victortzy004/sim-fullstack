@@ -20,6 +20,12 @@ class HoldingOut(BaseModel):
 
 class UserCreate(BaseModel):
     username: str
+
+class UserSummaryOut(BaseModel):
+    id: int
+    username: str
+    balance: float
+    model_config = ConfigDict(from_attributes=True)
     
 class UserOut(BaseModel):
     id: int

@@ -221,16 +221,14 @@ def health():
 # Fetch all users
 @app.get(
     "/users",
-    response_model=List[UserOut],
+    response_model=List[UserSummaryOut],
     tags=["Users"],
     summary="List all users",
     description="Fetch all users currently registered in the system."
 )
 def list_users(db: Session = Depends(get_db)):
-    # Either return ORM objects (Pydantic v2 from_attributes)...
-    users = db.query(User).order_by(User.id.asc()).all()
-    return [UserOut(id=u.id, username=u.username, balance=u.balance) for u in users]
-    
+    return db.query(User).order_by(User.id.asc()).all()
+
 
 # Fetch user by user_id
 @app.get(
