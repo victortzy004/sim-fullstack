@@ -180,6 +180,47 @@ def _user_out_by_filter(
     )
 
 
+def _enrich_holdings_with_prices(
+    db: Session,
+    holdings_rows: list[Holding],
+) -> list[HoldingOut]:
+    """Attach price/value (using buy curve on current reserve) to raw Holding rows."""
+    if not holdings_rows:
+        return []
+
+    # Prefetch reserves for all (market_id, token) pairs we need
+    m_ids = {h.market_id for h in holdings_rows if h.market_id is not None}
+    toks  = {h.token for h in holdings_rows}
+    res_map: dict[tuple[int, str], int] = {}
+
+    if m_ids and toks:
+        reserves = (
+            db.query(Reserve)
+              .filter(Reserve.market_id.in_(m_ids), Reserve.token.in_(toks))
+              .all()
+        )
+        res_map = {(r.market_id, r.token): int(r.shares or 0) for r in reserves}
+
+    # Build enriched outputs
+    out: list[HoldingOut] = []
+    for h in holdings_rows:
+        key = (h.market_id, h.token)
+        reserve_shares = res_map.get(key, 0)
+        price_now = float(buy_curve(reserve_shares))
+        shares = int(h.shares or 0)
+        out.append(
+            HoldingOut(
+                user_id=h.user_id,
+                market_id=h.market_id,
+                token=h.token,
+                shares=shares,
+                price=price_now,
+                value=price_now * shares,
+            )
+        )
+    return out
+
+
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(bind=engine)
@@ -779,7 +820,7 @@ def get_ownership_breakdown(
 
 
 # ====== User Holdings ======
-# Fetch user holdings via user_id
+# ====== User Holdings ======
 @app.get(
     "/holdings/{user_id}",
     response_model=List[HoldingOut],
@@ -795,9 +836,10 @@ def get_holdings(
     q = db.query(Holding).filter(Holding.user_id == user_id)
     if market_id is not None:
         q = q.filter(Holding.market_id == market_id)
-    return q.order_by(Holding.token.asc()).all()
+    rows = q.order_by(Holding.token.asc()).all()
+    return _enrich_holdings_with_prices(db, rows)
 
-# Fetch user holdings via username
+
 @app.get(
     "/holdings/by-username/{username}",
     response_model=List[HoldingOut],
@@ -821,7 +863,51 @@ def get_holdings_by_username(
     q = db.query(Holding).filter(Holding.user_id == u.id)
     if market_id is not None:
         q = q.filter(Holding.market_id == market_id)
-    return q.order_by(Holding.token.asc()).all()
+    rows = q.order_by(Holding.token.asc()).all()
+    return _enrich_holdings_with_prices(db, rows)
+# # Fetch user holdings via user_id
+# @app.get(
+#     "/holdings/{user_id}",
+#     response_model=List[HoldingOut],
+#     tags=["Holdings"],
+#     summary="Get holdings by user ID",
+#     description="Returns token holdings for the user. Optional ?market_id filter; if omitted, returns across all markets."
+# )
+# def get_holdings(
+#     user_id: Annotated[int, Path(..., ge=1, description="Numeric user ID", example=1)],
+#     market_id: Annotated[int | None, Query(ge=1, description="Optional market filter")] = None,
+#     db: Session = Depends(get_db),
+# ):
+#     q = db.query(Holding).filter(Holding.user_id == user_id)
+#     if market_id is not None:
+#         q = q.filter(Holding.market_id == market_id)
+#     return q.order_by(Holding.token.asc()).all()
+
+# # Fetch user holdings via username
+# @app.get(
+#     "/holdings/by-username/{username}",
+#     response_model=List[HoldingOut],
+#     tags=["Holdings"],
+#     summary="Get holdings by username",
+#     description="Case-insensitive lookup. Optional ?market_id filter; if omitted, returns across all markets."
+# )
+# def get_holdings_by_username(
+#     username: Annotated[str, Path(..., min_length=1, description="Username (case-insensitive)", example="alice")],
+#     market_id: Annotated[int | None, Query(ge=1, description="Optional market filter")] = None,
+#     db: Session = Depends(get_db),
+# ):
+#     u = (
+#         db.query(User)
+#           .filter(func.lower(User.username) == func.lower(username.strip()))
+#           .first()
+#     )
+#     if not u:
+#         raise HTTPException(status_code=404, detail="User not found")
+
+#     q = db.query(Holding).filter(Holding.user_id == u.id)
+#     if market_id is not None:
+#         q = q.filter(Holding.market_id == market_id)
+#     return q.order_by(Holding.token.asc()).all()
 
 # ====== Transaction Logs ======
 @app.get(
