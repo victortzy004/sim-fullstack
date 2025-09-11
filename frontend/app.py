@@ -92,6 +92,17 @@ def _get(path: str, timeout: float = 5.0, session: requests.Session | None = Non
     r.raise_for_status()
     return r.json()
 
+# --- Normalize outcomes -> TOKENS (strings) ---
+def _extract_tokens(market: dict) -> list[str]:
+    outs = market.get("outcomes") or []
+    if outs and isinstance(outs[0], dict):
+        # prefer 'token', fallback to 'display' or 'name'
+        toks = [(o.get("token") or o.get("display") or o.get("name") or "").strip()
+                for o in outs]
+    else:
+        toks = [str(o).strip() for o in outs]
+    # drop empties and normalize case (match your backend)
+    return [t.upper() for t in toks if t]
 
 # Cache snapshot
 @st.cache_data(ttl=5, show_spinner=False)
@@ -102,7 +113,7 @@ def fetch_snapshot(market_id: int, user_id: int | None, version: int = 0):
         fut_tx       = ex.submit(_get, "/tx", 5.0, s)
         fut_users    = ex.submit(_get, "/users", 5.0, s)
         fut_user     = ex.submit(_get, f"/users/{user_id}", 5.0, s)     if user_id else None
-        fut_holdings = ex.submit(_get, f"/holdings/{user_id}", 5.0, s)  if user_id else None
+        fut_holdings = ex.submit(_get, f"/holdings/{user_id}?market_id={market_id}", 5.0, s)  if user_id else None
         return {
             "market":   fut_market.result(),
             "tx":       fut_tx.result(),
@@ -116,7 +127,15 @@ snap = fetch_snapshot(MARKET_ID, st.session_state.get("user_id"), ver)
 
 # Market
 m = snap["market"]
-reserves: List[dict] = m.get("reserves", [])
+reserves = m.get("reserves") or []
+reserves_map = {
+    str(r.get("token", "")).upper(): {
+        "shares": int(r.get("shares") or 0),
+        "usdc": float(r.get("usdc") or 0.0),
+    }
+    for r in reserves
+}
+TOKENS = _extract_tokens(m)
 
 # Transactions
 tx_raw = pd.DataFrame(snap["tx"])
@@ -583,7 +602,6 @@ def compute_points_timeline(txp: pd.DataFrame, users_df: pd.DataFrame) -> pd.Dat
 
         # accumulate
         vol_points[uid] += float(add_points)
-
         # --- Apply the transaction to portfolio/reserves reconstruction ---
         if act == "Buy":
             delta = float(r["BuyAmt_Delta"] or 0.0)
@@ -1017,7 +1035,7 @@ if 'user_id' in st.session_state:
 user_id = st.session_state.get("user_id")
 if user_id is not None:
     # 1) Pull this user's transactions from API and map columns to what the cost-basis helper expects
-    tx_user = pd.DataFrame(api_get(f"/tx?user_id={user_id}"))
+    tx_user = pd.DataFrame(api_get(f"/tx?market_id={MARKET_ID}"))
 
     # If the API returns the "display" schema, remap to raw-style names:
     if not tx_user.empty:
@@ -1070,7 +1088,7 @@ if user_id is not None:
 
     pnl_df = pd.DataFrame(pnl_rows)
     st.markdown("**Per-Token Position & PnL**")
-    st.dataframe(pnl_df, width='stretch')
+    st.dataframe(pnl_df)
     st.divider()
 
 
@@ -1333,7 +1351,7 @@ if tx.empty:
     st.info("No transactions yet to compute history.")
 else:
     st.subheader("Transaction Log")
-    st.dataframe(tx_display, width='stretch')
+    st.dataframe(tx_display)
     st.divider()
 
     # 📈 Payout/Share Trend (reconstructed)
@@ -1574,6 +1592,14 @@ for token, token_tab in zip(TOKENS, token_tabs):
  # ===========================================================
 
 # Always fetch tx + users once
+
+# Filter tx_raw to only this market_id
+if "market_id" in tx_raw.columns:
+    tx_raw = tx_raw[pd.to_numeric(tx_raw["market_id"], errors="coerce").eq(MARKET_ID)].copy()
+else:
+    st.warning("No 'market_id' column in transactions; showing all.")
+
+# (then continue with your renames/processing using `tx`)
 txp = tx_raw
 if txp.empty:
     pass
@@ -1624,6 +1650,7 @@ else:
             act = r["Action"]
             tkn = r["Outcome"]
             qty = int(r["Quantity"])
+            print(user_state, reserves_state)
 
             if act == "Buy":
                 delta = float(r["BuyAmt_Delta"] or 0.0)
@@ -1809,7 +1836,10 @@ if not txp.empty:
         # ---- UI: let you sort by Payout to verify payouts after resolution ----
         metric_choice = st.radio(
             "Leaderboard metric (sort by):",
-            ["Portfolio Value", "PnL", "Payout"],
+            ["Portfolio Value", 
+             "PnL",
+            #  "Payout"
+             ],
             horizontal=True,
             key="lb_metric"
         )
@@ -1840,7 +1870,6 @@ if not txp.empty:
                     st.caption(f"Points: {row['TotalPoints']:,.0f}")
 
             st.dataframe(
-                latest[["User", "Payout", "PortfolioValue", "PnL", "VolumePoints", "PnLPoints", "TotalPoints"]],
-                width='stretch'
-            )
+                latest[["User", "Payout", "PortfolioValue", "PnL", "VolumePoints", "PnLPoints", "TotalPoints"]],            
+                )
 
