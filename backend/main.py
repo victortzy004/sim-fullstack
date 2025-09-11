@@ -820,7 +820,7 @@ def get_ownership_breakdown(
 
 
 # ====== User Holdings ======
-# ====== User Holdings ======
+# # Fetch user holdings via user_id
 @app.get(
     "/holdings/{user_id}",
     response_model=List[HoldingOut],
@@ -839,7 +839,7 @@ def get_holdings(
     rows = q.order_by(Holding.token.asc()).all()
     return _enrich_holdings_with_prices(db, rows)
 
-
+# Fetch user holdings via username
 @app.get(
     "/holdings/by-username/{username}",
     response_model=List[HoldingOut],
@@ -865,49 +865,6 @@ def get_holdings_by_username(
         q = q.filter(Holding.market_id == market_id)
     rows = q.order_by(Holding.token.asc()).all()
     return _enrich_holdings_with_prices(db, rows)
-# # Fetch user holdings via user_id
-# @app.get(
-#     "/holdings/{user_id}",
-#     response_model=List[HoldingOut],
-#     tags=["Holdings"],
-#     summary="Get holdings by user ID",
-#     description="Returns token holdings for the user. Optional ?market_id filter; if omitted, returns across all markets."
-# )
-# def get_holdings(
-#     user_id: Annotated[int, Path(..., ge=1, description="Numeric user ID", example=1)],
-#     market_id: Annotated[int | None, Query(ge=1, description="Optional market filter")] = None,
-#     db: Session = Depends(get_db),
-# ):
-#     q = db.query(Holding).filter(Holding.user_id == user_id)
-#     if market_id is not None:
-#         q = q.filter(Holding.market_id == market_id)
-#     return q.order_by(Holding.token.asc()).all()
-
-# # Fetch user holdings via username
-# @app.get(
-#     "/holdings/by-username/{username}",
-#     response_model=List[HoldingOut],
-#     tags=["Holdings"],
-#     summary="Get holdings by username",
-#     description="Case-insensitive lookup. Optional ?market_id filter; if omitted, returns across all markets."
-# )
-# def get_holdings_by_username(
-#     username: Annotated[str, Path(..., min_length=1, description="Username (case-insensitive)", example="alice")],
-#     market_id: Annotated[int | None, Query(ge=1, description="Optional market filter")] = None,
-#     db: Session = Depends(get_db),
-# ):
-#     u = (
-#         db.query(User)
-#           .filter(func.lower(User.username) == func.lower(username.strip()))
-#           .first()
-#     )
-#     if not u:
-#         raise HTTPException(status_code=404, detail="User not found")
-
-#     q = db.query(Holding).filter(Holding.user_id == u.id)
-#     if market_id is not None:
-#         q = q.filter(Holding.market_id == market_id)
-#     return q.order_by(Holding.token.asc()).all()
 
 # ====== Transaction Logs ======
 @app.get(
