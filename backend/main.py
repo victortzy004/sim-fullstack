@@ -905,13 +905,22 @@ def trade(payload: TradeIn, db: Session = Depends(get_db)):
         raise HTTPException(400, str(e))
 
 # ====== Leaderboard / Points ======
-@app.get("/leaderboard", response_model=List[LeaderboardRow],
-         tags=["Leaderboard"], summary="View leaderboard standings")
-def leaderboard(db: Session = Depends(get_db)):
-    rows = compute_user_points(db)
-    # sort by pnl desc (like your app)
+@app.get(
+    "/leaderboard",
+    response_model=List[LeaderboardRow],
+    tags=["Leaderboard"],
+    summary="View leaderboard standings",
+    description="Leaderboard computed from trades in the selected market. "
+                "If market_id is omitted, uses all tx across all markets (global view)."
+)
+def leaderboard(
+    market_id: Annotated[int | None, Query(ge=1, description="Optional market filter")] = None,
+    db: Session = Depends(get_db),
+):
+    rows = compute_user_points(db, market_id=market_id)
     rows.sort(key=lambda r: r["pnl"], reverse=True)
     return rows
+
 
 # @app.get("/points_timeline", response_model=List[PointsTimelineRow])
 # def points_timeline(db: Session = Depends(get_db)):
