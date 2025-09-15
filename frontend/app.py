@@ -674,31 +674,6 @@ with st.sidebar:
         st.error("Username not whitelisted.")
     join_disabled = bool(username_input) and (username_input not in WHITELIST)
 
-    # if st.button("Join / Load", disabled=join_disabled):
-    #     if not username_input:
-    #         st.warning("Please enter a username.")
-    #     else:
-    #         with closing(get_conn()) as conn, conn:
-    #             c = conn.cursor()
-    #             # enforce max 10 users at create time
-    #             row = c.execute("SELECT id, balance FROM users WHERE username=?", (username_input,)).fetchone()
-    #             if not row:
-    #                 cnt = c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
-    #                 if cnt >= 20:
-    #                     st.error("Max 20 users reached. Try another time.")
-    #                     st.stop()
-    #                 c.execute(
-    #                     "INSERT INTO users(username,balance,created_at) VALUES(?,?,?)",
-    #                     (username_input, STARTING_BALANCE, datetime.utcnow().isoformat()),
-    #                 )
-    #                 user_id = c.lastrowid
-    #                 for t in TOKENS:
-    #                     c.execute("INSERT OR IGNORE INTO holdings(user_id,token,shares) VALUES(?,?,0)", (user_id, t))
-    #             else:
-    #                 user_id = row["id"]
-    #         st.session_state.user_id = int(user_id)
-    #         st.session_state.username = username_input
-    #         st.rerun()
     if st.button("Join / Load", disabled=join_disabled):
         if not username_input:
             st.warning("Please enter a username.")
@@ -771,7 +746,7 @@ if "user_id" in st.session_state and st.session_state.get("username") == "admin"
     admin_pwd = st.sidebar.text_input("Admin password", type="password", key="admin_pwd")
     pw_missing = not bool(admin_pwd)
 
-    if server_active:
+    if server_active or (not server_active and resolved_flag == 0):
  
 
         st.sidebar.markdown("### Resolve Market")
@@ -1650,7 +1625,6 @@ else:
             act = r["Action"]
             tkn = r["Outcome"]
             qty = int(r["Quantity"])
-            print(user_state, reserves_state)
 
             if act == "Buy":
                 delta = float(r["BuyAmt_Delta"] or 0.0)
