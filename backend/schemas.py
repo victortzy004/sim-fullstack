@@ -54,6 +54,7 @@ class AdminStartRequest(StartRequest):
     password: str = Field(..., min_length=1, description="Admin password")
     duration_days: Optional[int] = None
     reset_reserves: bool = False
+    end_ts: Optional[str] = None 
 
     # NEW (all optional)
     question: Optional[str] = None
@@ -74,8 +75,8 @@ class AdminConfigureMarketRequest(BaseModel):
     password: str
     question: str | None = None
     resolution_note: str | None = None
-    tokens: list[str] | None = None  # canonical outcomes list (order matters)
-
+    outcomes: list[str] | None = None  # canonical outcomes list (order matters)
+    end_ts: Optional[str] = None 
 
 class ReserveOut(BaseModel):
     market_id: int

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Body, status, Path, Query
+from fastapi import FastAPI, Depends, HTTPException, Body, status, Path, Query, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import func, select
 from typing import List, Annotated
@@ -10,7 +10,7 @@ from dotenv import load_dotenv, find_dotenv
 from .db import Base, engine, get_db
 from .models import User, Market, Reserve, Holding, Tx, MarketOutcome
 from .schemas import *
-from .logic import do_trade, buy_curve, compute_user_points, is_market_active, ownership_breakdown, preview_for_side_mode, list_market_outcomes, STARTING_BALANCE, MARKET_DURATION_DAYS, TOKENS
+from .logic import do_trade, buy_curve, compute_user_points, is_market_active, parse_to_naive_utc, ownership_breakdown, preview_for_side_mode, list_market_outcomes, STARTING_BALANCE, MARKET_DURATION_DAYS, TOKENS
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -302,22 +302,6 @@ def get_user_by_username(
     return _user_out_by_filter(db, username=username, market_id=market_id)
 
 
-# @app.get("/users/with-points", response_model=List[UserWithPointsOut])
-# def list_users_with_points(db: Session = Depends(get_db)):
-#     users = db.query(User).order_by(User.id.asc()).all()
-#     out = []
-#     pts_all = { (r.get("user_id") or r.get("id")): r for r in compute_user_points(db) }
-#     for u in users:
-#         pr = pts_all.get(u.id, {})
-#         out.append(UserWithPointsOut(
-#             id=u.id, username=u.username, balance=u.balance,
-#             volume_points=float(pr.get("volume_points") or pr.get("VolumePoints") or 0.0),
-#             pnl_points=float(pr.get("pnl_points") or pr.get("PnLPoints") or 0.0),
-#             total_points=float(pr.get("total_points") or pr.get("TotalPoints") or 0.0),
-#         ))
-#     print(out)
-#     return out
-
 # Update user data via username
 @app.post("/users", response_model=UserOut, status_code=status.HTTP_201_CREATED,
           tags=["Users"], summary="Create or load user")
@@ -337,10 +321,6 @@ def join_or_load_user(payload: UserCreate, db: Session = Depends(get_db)):
     db.add(user)
     db.flush()  # gets user.id
 
-    # create zero holdings rows for each token
-    # for t in TOKENS:
-    #     db.add(Holding(user_id=user.id, token=t, shares=0))
-
     db.commit()
     db.refresh(user)
     return UserOut(id=user.id, username=user.username, balance=user.balance)
@@ -348,47 +328,6 @@ def join_or_load_user(payload: UserCreate, db: Session = Depends(get_db)):
 
 # ====== Admin ======
 # Start new market
-# @app.post("/admin/{market_id}/start", response_model=MarketOut,
-#           tags=["Admin"], summary="Start market",
-#           description="Starts a market. Requires admin password in body.")
-# def admin_start(
-#     market_id: int,
-#     req: AdminStartRequest = Body(...),
-#     db: Session = Depends(get_db),
-# ):
-#     _assert_admin(req.password)
-
-#     now = _now_iso()
-#     end = (datetime.utcnow() + timedelta(days=req.duration_days or MARKET_DURATION_DAYS))\
-#             .replace(microsecond=0).isoformat()
-
-#     m = db.get(Market, market_id)
-#     if not m:
-#         m = Market(id=market_id, start_ts=now, end_ts=end, winner_token=None, resolved=0, resolved_ts=None)
-#         db.add(m)
-#     else:
-#         if is_market_active(m):
-#             raise HTTPException(status_code=400, detail="Market already active.")
-#         m.start_ts = now
-#         m.end_ts = end
-#         m.winner_token = None
-#         m.resolved = 0
-#         m.resolved_ts = None
-
-#     # Ensure reserves for THIS market
-#     for t in TOKENS:
-#         r = db.query(Reserve).filter(Reserve.market_id == market_id, Reserve.token == t).first()
-#         if not r:
-#             db.add(Reserve(market_id=market_id, token=t, shares=0, usdc=0.0))
-#         elif req.reset_reserves:
-#             r.shares = 0
-#             r.usdc = 0.0
-
-#     db.commit()
-#     db.refresh(m)
-#     return _market_to_out(db, m)
-
-
 @app.post("/admin/{market_id}/start", response_model=MarketOut,
           tags=["Admin"], summary="Start market",
           description="Starts a market. Requires admin password in body.")
@@ -435,15 +374,26 @@ def admin_start(
         desired_outcomes = None  # means: keep existing if any, else use DEFAULT_OUTCOMES
 
     now = _now_iso()
-    end = (datetime.utcnow() + timedelta(days=req.duration_days or MARKET_DURATION_DAYS))\
-            .replace(microsecond=0).isoformat()
+    if getattr(req, "end_ts", None):
+        try:
+            end_iso = parse_to_naive_utc(req.end_ts)  # normalizes to UTC-naive "YYYY-MM-DDTHH:MM:SS"
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid end_ts (expect ISO-8601, e.g. '2026-06-30T12:00:00Z')")
+        if datetime.fromisoformat(end_iso) <= datetime.fromisoformat(now):
+            raise HTTPException(status_code=400, detail="end_ts must be strictly after current UTC time")
+    else:
+        # fallback to duration_days or default MARKET_DURATION_DAYS
+        end_iso = (datetime.utcnow() + timedelta(days=(req.duration_days or MARKET_DURATION_DAYS)))\
+                    .replace(microsecond=0).isoformat()
+    
+
 
     m = db.get(Market, market_id)
     if not m:
         m = Market(
             id=market_id,
             start_ts=now,
-            end_ts=end,
+            end_ts=end_iso,
             winner_token=None,
             resolved=0,
             resolved_ts=None,
@@ -456,7 +406,7 @@ def admin_start(
         if is_market_active(m):
             raise HTTPException(status_code=400, detail="Market already active.")
         m.start_ts = now
-        m.end_ts = end
+        m.end_ts = end_iso
         m.winner_token = None
         m.resolved = 0
         m.resolved_ts = None
@@ -528,39 +478,6 @@ def admin_start(
     db.refresh(m)
     return _market_to_out(db, m)
 
-    # # Work out the *final* outcome list to enforce in reserves
-    # existing_tokens = {
-    #     r.token for r in db.query(Reserve).filter(Reserve.market_id == market_id).all()
-    # }
-    # if desired_outcomes is None:
-    #     desired = list(existing_tokens) if existing_tokens else list(DEFAULT_OUTCOMES)
-    # else:
-    #     desired = desired_outcomes
-
-    # desired_set = set(desired)
-
-    # # Add missing reserves for desired outcomes
-    # for t in desired:
-    #     if t not in existing_tokens:
-    #         db.add(Reserve(market_id=market_id, token=t, shares=0, usdc=0.0))
-
-    # # Remove reserves that are no longer desired (safe here because we are starting a new market)
-    # for t in (existing_tokens - desired_set):
-    #     db.query(Reserve).filter(
-    #         Reserve.market_id == market_id,
-    #         Reserve.token == t
-    #     ).delete(synchronize_session=False)
-
-    # # Optionally reset reserves
-    # if req.reset_reserves:
-    #     db.query(Reserve).filter(Reserve.market_id == market_id).update(
-    #         {Reserve.shares: 0, Reserve.usdc: 0.0},
-    #         synchronize_session=False
-    #     )
-
-    # db.commit()
-    # db.refresh(m)
-    # return _market_to_out(db, m)
 
 # Admin market reset (makes market active)
 @app.post(
@@ -714,8 +631,24 @@ def admin_configure(
     if req.resolution_note is not None:
         m.resolution_note = req.resolution_note
 
-    if req.tokens is not None:
-        tokens = [t.strip().upper() for t in req.tokens if t.strip()]
+    # --- end_ts (must be in the future) ---
+    # Accepts ISO-8601 strings like '2026-06-30T12:00:00', '2026-06-30T12:00:00Z', or with offsets
+    if getattr(req, "end_ts", None) is not None:
+        try:
+            new_end_iso = parse_to_naive_utc(req.end_ts)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid end_ts format (expected ISO-8601)")
+
+        now_iso = _now_iso()
+        now_dt = datetime.fromisoformat(now_iso)
+        end_dt = datetime.fromisoformat(new_end_iso)
+        if end_dt <= now_dt:
+            raise HTTPException(status_code=400, detail="end_ts must be strictly after current UTC time")
+
+        m.end_ts = new_end_iso
+
+    if req.outcomes is not None:
+        tokens = [t.strip().upper() for t in req.outcomes if t.strip()]
         if not tokens:
             raise HTTPException(400, "tokens must be non-empty")
 
@@ -871,19 +804,56 @@ def get_holdings_by_username(
     "/tx",
     response_model=List[TxOut],
     tags=["Transactions"],
-    summary="List all transaction logs",
-    description="Returns every transaction in the system ordered by timestamp (ascending). "
-                "Includes buys, sells, resolves, deltas, and post-trade balances."
+    summary="List transaction logs (filter, latest-N, pagination)",
+    description=(
+        "Returns transaction logs ordered by timestamp. "
+        "Use `market_id` to filter; `limit` to fetch the latest N; "
+        "`page` + `page_size` for pagination; and `sort` to choose ordering."
+    ),
 )
 def get_tx(
+    response: Response,
     market_id: Annotated[int | None, Query(ge=1, description="Filter by market id")] = None,
+    # Choose ordering; default asc to keep backward-compat with your existing behavior
+    sort: Annotated[Literal["asc", "desc"], Query(description="Sort by timestamp")] = "asc",
+    # Quick 'latest N' (ignores pagination if set). Bound to reasonable max.
+    limit: Annotated[int | None, Query(ge=1, le=1000, description="Return only the latest N entries (ignores pagination)")] = None,
+    # Pagination (1-based page index)
+    page: Annotated[int | None, Query(ge=1, description="1-based page index")] = None,
+    page_size: Annotated[int | None, Query(ge=1, le=1000, description="Items per page")] = None,
     db: Session = Depends(get_db),
 ):
-    q = db.query(Tx).order_by(Tx.ts.asc())
+    q = db.query(Tx)
     if market_id is not None:
         q = q.filter(Tx.market_id == market_id)
-    return q.all()
 
+    # Apply ordering first
+    order_col = Tx.ts.desc() if sort == "desc" else Tx.ts.asc()
+    q = q.order_by(order_col)
+
+    # ---- Latest N (takes precedence over pagination)
+    if limit is not None:
+        rows = q.limit(limit).all()
+        # For latest-N we expose count of returned rows (not total) to avoid an extra COUNT(*)
+        response.headers["X-Total-Count"] = str(len(rows))
+        return rows
+
+    # ---- Pagination
+    # If either `page` or `page_size` is provided, default the other sensibly
+    if page is not None or page_size is not None:
+        page = page or 1
+        page_size = page_size or 50
+
+        total = q.count()
+        rows = q.offset((page - 1) * page_size).limit(page_size).all()
+
+        response.headers["X-Total-Count"] = str(total)
+        response.headers["X-Page"] = str(page)
+        response.headers["X-Page-Size"] = str(page_size)
+        return rows
+
+    # ---- Default (no limit, no pagination)
+    return q.all()
 
 # ====== Trading ======
 # Post a trade action for a user

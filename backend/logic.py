@@ -1,5 +1,5 @@
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Any, List
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func
@@ -32,24 +32,10 @@ def buy_curve(x: float) -> float:
     return (x**(1/3)/1000) + 0.1
     # return x**(1/4) + x / 400
 
-# def sell_curve(x: float) -> float:
-#     t = (x - 500000.0) / 1_000_000.0
-#     p = 1.0 / (4.0 * (0.8 + math.exp(-t))) - 0.05
-#     return max(p,0.0)
-#     # return ((x - 500)/40) / ((8 + ((x - 500)/80)**2)**0.5) + (x - 500)/300 + 3.6
 
 def buy_delta(x: float) -> float:
     return (3.0/4000.0) * (x**(4.0/3.0)) + x/10.0
     # return (640 * x**(5/4) + x**2) / 800
-
-# def sell_delta(x: float) -> float:
-#     """
-#     ∫ y dx = 312500 * ln(1 + 0.8 * e^{(x-500000)/1e6}) - 0.05*x + C, C=0
-#     """
-#     t = (x - 500000.0) / 1_000_000.0
-#     # use log1p for better numerical stability
-#     return 312_500.0 * math.log1p(0.8 * math.exp(t)) - 0.05 * x
-#     # return 1.93333 * x + 0.00166667 * x**2 + 2 * math.sqrt(301200 - 1000 * x + x**2)
 
 
 # ===== Sale Tax Helpers (new) =====
@@ -199,6 +185,24 @@ def _parse_ts(s: str):
         return datetime.fromisoformat(s.replace("Z", ""))
     except Exception:
         return None
+
+def parse_to_naive_utc(dt_str: str) -> str:
+    """
+    Accepts common ISO-8601 forms (with/without 'Z' or offset),
+    returns a naive UTC ISO string (no microseconds), e.g. '2026-01-01T00:00:00'.
+    """
+    s = dt_str.strip()
+    # Allow 'Z'
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    # datetime.fromisoformat handles '+HH:MM' offsets; if none, assume naive (UTC)
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        # Treat naive as UTC (your API uses UTC-naive everywhere)
+        dt_utc = dt
+    else:
+        dt_utc = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt_utc.replace(microsecond=0).isoformat()
 
 # Market helper
 def is_market_active_with_reason(m) -> tuple[bool, str]:
