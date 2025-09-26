@@ -153,8 +153,8 @@ class LeaderboardRow(BaseModel):
     user: str
     portfolio_value: float
     pnl: float
-    volume_points: float
-    pnl_points: float
+    mint_points: float
+    realised_pnl_points: float
     total_points: float
 
 class PointsTimelineRow(BaseModel):

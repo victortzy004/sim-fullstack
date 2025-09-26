@@ -542,68 +542,104 @@ def admin_reset(
     return {"status": "ok", "market_active": True, "start_ts": m.start_ts, "end_ts": m.end_ts}
 
 # Resolve market
-@app.post("/admin/{market_id}/resolve",
-          tags=["Admin"], summary="Resolve a market",
-          description="Resolves a market. Requires admin password in body.")
+@app.post(
+    "/admin/{market_id}/resolve",
+    tags=["Admin"],
+    summary="Resolve a market",
+    description="Resolves a market. Requires admin password in body.",
+)
 def admin_resolve(
     market_id: int,
     payload: AdminResolveRequest = Body(...),
     db: Session = Depends(get_db),
 ):
-    print(payload)
     _assert_admin(payload.password)
 
-    winner_token = (payload.winner_token or "").strip().upper()
-    if winner_token not in TOKENS:
-        raise HTTPException(status_code=400, detail="Invalid winner_token")
-
+    # --- validate market exists and is not already resolved
     m = db.get(Market, market_id)
     if not m:
         raise HTTPException(status_code=404, detail="Market not found")
     if int(m.resolved or 0) == 1:
         raise HTTPException(status_code=400, detail="Market already resolved")
 
-    # Sum pool for THIS market
+    # --- fetch valid outcome tokens for THIS market (case-insensitive set)
+    rows = db.query(MarketOutcome.token).filter(MarketOutcome.market_id == market_id).all()
+    valid_tokens = { (t or "").upper() for (t,) in rows }
+    if not valid_tokens:
+        raise HTTPException(status_code=400, detail="Market has no configured outcomes")
+
+    winner_token = (payload.winner_token or "").strip().upper()
+    if winner_token not in valid_tokens:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid winner_token for market {market_id}. Allowed: {sorted(valid_tokens)}",
+        )
+
+    # --- pool and winning supply for THIS market
     tot_pool = float(
         db.query(func.coalesce(func.sum(Reserve.usdc), 0.0))
           .filter(Reserve.market_id == market_id)
           .scalar() or 0.0
     )
 
-    # Winning shares for THIS market
-    win_res = db.query(Reserve).filter(
-        Reserve.market_id == market_id, Reserve.token == winner_token
-    ).first()
+    # IMPORTANT: case-insensitive match on token for safety
+    win_res = (
+        db.query(Reserve)
+          .filter(
+              Reserve.market_id == market_id,
+              func.upper(Reserve.token) == winner_token,
+          )
+          .first()
+    )
     win_shares = int(win_res.shares if win_res else 0)
 
+    # --- compute payouts (pro-rata on this market's winning token)
     payouts = {}
     if tot_pool > 0 and win_shares > 0:
-        # NOTE: If you ever run multiple markets concurrently,
-        # you should add market_id to Holding and filter by it here.
-        for h in db.query(Holding).filter(Holding.token == winner_token, Holding.market_id == market_id, Holding.shares > 0).all():
-            share = h.shares
+        for h in (
+            db.query(Holding)
+              .filter(
+                  Holding.market_id == market_id,
+                  func.upper(Holding.token) == winner_token,
+                  Holding.shares > 0,
+              )
+              .all()
+        ):
+            share = int(h.shares)
             payout = tot_pool * (share / win_shares)
             payouts[h.user_id] = payouts.get(h.user_id, 0.0) + float(payout)
 
-    now_iso = datetime.utcnow().isoformat()
+    # --- credit users & log resolution tx
+    now_iso = datetime.utcnow().replace(microsecond=0).isoformat()
     for uid, amt in payouts.items():
         u = db.get(User, uid)
         if not u:
             continue
         u.balance = float(u.balance or 0.0) + float(amt)
-        db.add(Tx(
-            ts=now_iso, user_id=uid, market_id=market_id, user_name=u.username, action="Resolve", token=winner_token,
-            qty=0, buy_price=None, sell_price=None, buy_delta=None, sell_delta=float(amt),
-            balance_after=u.balance
-        ))
+        db.add(
+            Tx(
+                ts=now_iso,
+                user_id=uid,
+                market_id=market_id,
+                user_name=u.username,
+                action="Resolve",
+                token=winner_token,
+                qty=0,
+                buy_price=None,
+                sell_price=None,
+                buy_delta=None,
+                sell_delta=float(amt),
+                balance_after=u.balance,
+            )
+        )
 
-    # Zero out ONLY this market's reserves
+    # --- clear reserves (ONLY this market)
     for r in db.query(Reserve).filter(Reserve.market_id == market_id).all():
         r.shares = 0
         r.usdc = 0.0
 
-    # (Optional) Zero holdings if you want a clean slate:
-    # for h in db.query(Holding).all(): h.shares = 0
+    # (Optional but recommended) zero holdings for this market so the UI/points rebuild cleanly
+    # db.query(Holding).filter(Holding.market_id == market_id).update({Holding.shares: 0})
 
     m.winner_token = winner_token
     m.resolved = 1
@@ -612,6 +648,78 @@ def admin_resolve(
 
     db.commit()
     return {"status": "ok", "payout_pool": tot_pool, "winner_token": winner_token}
+
+# # Resolve market
+# @app.post("/admin/{market_id}/resolve",
+#           tags=["Admin"], summary="Resolve a market",
+#           description="Resolves a market. Requires admin password in body.")
+# def admin_resolve(
+#     market_id: int,
+#     payload: AdminResolveRequest = Body(...),
+#     db: Session = Depends(get_db),
+# ):
+#     print(payload)
+#     _assert_admin(payload.password)
+
+#     winner_token = (payload.winner_token or "").strip().upper()
+#     if winner_token not in TOKENS:
+#         raise HTTPException(status_code=400, detail="Invalid winner_token")
+
+#     m = db.get(Market, market_id)
+#     if not m:
+#         raise HTTPException(status_code=404, detail="Market not found")
+#     if int(m.resolved or 0) == 1:
+#         raise HTTPException(status_code=400, detail="Market already resolved")
+
+#     # Sum pool for THIS market
+#     tot_pool = float(
+#         db.query(func.coalesce(func.sum(Reserve.usdc), 0.0))
+#           .filter(Reserve.market_id == market_id)
+#           .scalar() or 0.0
+#     )
+
+#     # Winning shares for THIS market
+#     win_res = db.query(Reserve).filter(
+#         Reserve.market_id == market_id, Reserve.token == winner_token
+#     ).first()
+#     win_shares = int(win_res.shares if win_res else 0)
+
+#     payouts = {}
+#     if tot_pool > 0 and win_shares > 0:
+#         # NOTE: If you ever run multiple markets concurrently,
+#         # you should add market_id to Holding and filter by it here.
+#         for h in db.query(Holding).filter(Holding.token == winner_token, Holding.market_id == market_id, Holding.shares > 0).all():
+#             share = h.shares
+#             payout = tot_pool * (share / win_shares)
+#             payouts[h.user_id] = payouts.get(h.user_id, 0.0) + float(payout)
+
+#     now_iso = datetime.utcnow().isoformat()
+#     for uid, amt in payouts.items():
+#         u = db.get(User, uid)
+#         if not u:
+#             continue
+#         u.balance = float(u.balance or 0.0) + float(amt)
+#         db.add(Tx(
+#             ts=now_iso, user_id=uid, market_id=market_id, user_name=u.username, action="Resolve", token=winner_token,
+#             qty=0, buy_price=None, sell_price=None, buy_delta=None, sell_delta=float(amt),
+#             balance_after=u.balance
+#         ))
+
+#     # Zero out ONLY this market's reserves
+#     for r in db.query(Reserve).filter(Reserve.market_id == market_id).all():
+#         r.shares = 0
+#         r.usdc = 0.0
+
+#     # (Optional) Zero holdings if you want a clean slate:
+#     # for h in db.query(Holding).all(): h.shares = 0
+
+#     m.winner_token = winner_token
+#     m.resolved = 1
+#     m.resolved_ts = now_iso
+#     m.end_ts = now_iso
+
+#     db.commit()
+#     return {"status": "ok", "payout_pool": tot_pool, "winner_token": winner_token}
 
 # main.py
 @app.post("/admin/{market_id}/configure", tags=["Admin"], summary="Configure market copy & outcomes")

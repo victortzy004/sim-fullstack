@@ -19,13 +19,8 @@ TOKENS = ["YES", "NO"]
 MAX_SHARES = 5000000 #5M
 
 # Points
-TRADE_POINTS_PER_USD = 10.0
-PNL_POINTS_PER_USD   = 5.0
-EARLY_QUANTITY_POINT = 270
-MID_QUANTITY_POINT   = 630
-EARLY_MULTIPLIER     = 1.5
-MID_MULTIPLIER       = 1.25
-LATE_MULTIPLIER      = 1.0
+MINT_POINTS_PER_SHARE        = 10.0 
+REALISED_PNL_POINTS_PER_USD  = 5.0   
 
 # Math Helpers (curves)
 def buy_curve(x: float) -> float:
@@ -491,63 +486,176 @@ def ownership_breakdown(
     }
 
 # # ---- Points + Leaderboard helpers (same math as app) ----
-# def compute_user_points(db: Session):
-#     # collect tx + users
-#     tx = db.execute(select(Tx).order_by(Tx.ts.asc())).scalars().all()
-#     users = db.execute(select(User.id, User.username)).all()
-#     id2name = {u.id: u.username for u in db.query(User).all()}
+def compute_user_points(db: Session, market_id: Optional[int] = None):
+    """
+    New points model:
+      - Mint points: 10 pts/share for any shares still held at the instant of market resolution.
+        Awarded once when a Resolve occurs (snapshot all users' holdings before wiping).
+        If the market is resolved but no Resolve tx rows exist, award at the end using the
+        final holdings snapshot.
+      - Realised PnL points: 5 pts per $1 of realised PROFIT ONLY (>=0).
+          * Sell: proceeds - (avg cost of shares sold)
+          * Resolve (winners): payout - (avg cost of remaining winning shares)
+    Returns: list of dicts per user: user, portfolio_value, pnl,
+             mint_points, realised_pnl_points, total_points.
+    """
+    # Load tx (optionally filtered) ordered by time
+    tx_q = db.query(Tx).order_by(Tx.ts.asc())
+    if market_id is not None:
+        tx_q = tx_q.filter(Tx.market_id == market_id)
+    tx = tx_q.all()
 
-#     reserves_state = {t: 0 for t in TOKENS}
-#     vol_points = {uid: 0.0 for uid in id2name.keys()}
+    users = {u.id: u.username for u in db.query(User).all()}
 
-#     for r in tx:
-#         if r.action == "Buy":
-#             buy_usd = float(r.buy_delta or 0.0)
-#             reserve_before = reserves_state[r.token]
-#             mult = EARLY_MULTIPLIER if reserve_before < EARLY_QUANTITY_POINT else (
-#                    MID_MULTIPLIER if reserve_before < MID_QUANTITY_POINT else LATE_MULTIPLIER)
-#             vol_points[r.user_id] += buy_usd * TRADE_POINTS_PER_USD * mult
-#             reserves_state[r.token] += int(r.qty)
-#         elif r.action == "Sell":
-#             sell_usd = float(r.sell_delta or 0.0)
-#             vol_points[r.user_id] += sell_usd * TRADE_POINTS_PER_USD
-#             reserves_state[r.token] -= int(r.qty)
+    # Market resolved flag (only meaningful when market_id is provided)
+    m = db.get(Market, market_id) if market_id is not None else None
+    market_is_resolved = bool(m and int(m.resolved or 0) == 1)
 
-#     # build latest portfolio snapshot (buy-price valuation)
-#     reserves_state = {t: 0 for t in TOKENS}
-#     user_state = {uid: {"balance": STARTING_BALANCE, "holdings": {t:0 for t in TOKENS}} for uid in id2name}
+    if not tx:
+        # Baseline rows if no activity
+        return [
+            {
+                "user": uname,
+                "portfolio_value": STARTING_BALANCE,
+                "pnl": 0.0,
+                "mint_points": 0.0,
+                "realised_pnl_points": 0.0,
+                "total_points": 0.0,
+            }
+            for uid, uname in users.items()
+        ]
 
-#     for r in tx:
-#         if r.action == "Buy":
-#             reserves_state[r.token] += int(r.qty)
-#             user_state[r.user_id]["balance"] -= float(r.buy_delta or 0.0)
-#             user_state[r.user_id]["holdings"][r.token] += int(r.qty)
-#         elif r.action == "Sell":
-#             reserves_state[r.token] -= int(r.qty)
-#             user_state[r.user_id]["balance"] += float(r.sell_delta or 0.0)
-#             user_state[r.user_id]["holdings"][r.token] -= int(r.qty)
-#         elif r.action == "Resolve":
-#             payout = float(r.sell_delta or 0.0)
-#             user_state[r.user_id]["balance"] += payout
-#             for u in user_state:
-#                 user_state[u]["holdings"] = {t:0 for t in TOKENS}
-#             reserves_state = {t:0 for t in TOKENS}
+    # Determine token universe for this scope
+    if market_id is not None:
+        TOKS = sorted(_token_set_for_market(db, market_id)) or []
+    else:
+        TOKS = sorted({r.token for r in tx if r.token})  # global union
+    if not TOKS:
+        TOKS = []
 
-#     prices = {t: buy_curve(reserves_state[t]) for t in TOKENS}
-#     rows = []
-#     for uid, s in user_state.items():
-#         pv = s["balance"] + sum(s["holdings"][t]*prices[t] for t in TOKENS)
-#         pnl = pv - STARTING_BALANCE
-#         pnl_points = max(pnl, 0.0) * PNL_POINTS_PER_USD
-#         rows.append({
-#             "user": id2name[uid],
-#             "portfolio_value": pv,
-#             "pnl": pnl,
-#             "volume_points": vol_points[uid],
-#             "pnl_points": pnl_points,
-#             "total_points": vol_points[uid] + pnl_points
-#         })
-#     return rows
+    # ---- State while walking the timeline ----
+    reserves_state = {t: 0 for t in TOKS}  # circulating shares
+    user_state = {
+        uid: {"balance": STARTING_BALANCE, "holdings": {t: 0 for t in TOKS}}
+        for uid in users.keys()
+    }
+
+    # Running-average cost basis per user+token
+    pos = {uid: {t: {"shares": 0, "cost": 0.0} for t in TOKS} for uid in users.keys()}
+
+    # Point tallies
+    mint_points = {uid: 0.0 for uid in users.keys()}
+    realised_profit_usd = {uid: 0.0 for uid in users.keys()}
+
+    # We award mint points exactly once
+    mint_awarded = False
+
+    # ---- Walk chronologically ----
+    for r in tx:
+        uid = int(r.user_id)
+        tkn = r.token
+        act = (r.action or "").strip()
+
+        # Defensive: add unseen token on the fly
+        if tkn and tkn not in reserves_state:
+            reserves_state[tkn] = 0
+            for st in user_state.values():
+                st["holdings"].setdefault(tkn, 0)
+            for p in pos.values():
+                p.setdefault(tkn, {"shares": 0, "cost": 0.0})
+
+        if act == "Buy":
+            q = int(r.qty or 0)
+            usd = float(r.buy_delta or 0.0)
+            reserves_state[tkn] += q
+            user_state[uid]["balance"] -= usd
+            user_state[uid]["holdings"][tkn] += q
+            # running-average basis
+            pos[uid][tkn]["shares"] += q
+            pos[uid][tkn]["cost"]   += usd
+
+        elif act == "Sell":
+            q = int(r.qty or 0)
+            usd = float(r.sell_delta or 0.0)
+            reserves_state[tkn] -= q
+            user_state[uid]["balance"] += usd
+            user_state[uid]["holdings"][tkn] -= q
+            # realise vs avg cost
+            s_prev = max(0, pos[uid][tkn]["shares"])
+            c_prev = max(0.0, pos[uid][tkn]["cost"])
+            if s_prev > 0 and q > 0:
+                used = min(q, s_prev)
+                avg = c_prev / float(s_prev)
+                realised = usd - avg * used
+                if realised > 0:
+                    realised_profit_usd[uid] += realised
+                pos[uid][tkn]["shares"] = s_prev - used
+                pos[uid][tkn]["cost"]   = c_prev - avg * used
+
+        elif act == "Resolve":
+            # 1) Award mint points ONCE for ALL users at the instant of resolution.
+            if not mint_awarded:
+                for u2 in users.keys():
+                    outstanding = sum(int(user_state[u2]["holdings"].get(t, 0)) for t in TOKS)
+                    if outstanding > 0:
+                        mint_points[u2] += outstanding * MINT_POINTS_PER_SHARE
+                mint_awarded = True
+
+            # 2) Realise winner payout vs remaining winning basis for THIS recipient
+            payout = float(r.sell_delta or 0.0)
+            winner = tkn  # Resolve rows use the winning token
+            if payout > 0.0 and winner:
+                s_win = max(0, pos[uid][winner]["shares"])
+                c_win = max(0.0, pos[uid][winner]["cost"])
+                if s_win > 0:
+                    avg_win = c_win / float(s_win)
+                    realised = payout - (avg_win * s_win)
+                    if realised > 0:
+                        realised_profit_usd[uid] += realised
+
+            # 3) Wipe ALL users' holdings, reserves, and bases (market is closed)
+            for u2 in users.keys():
+                user_state[u2]["holdings"] = {t: 0 for t in TOKS}
+                for t in TOKS:
+                    pos[u2][t] = {"shares": 0, "cost": 0.0}
+            for t in TOKS:
+                reserves_state[t] = 0
+
+        # else: ignore unknown actions
+
+    # If market is resolved but we never saw a Resolve row (e.g., zero pool),
+    # award mint points from the final holdings snapshot.
+    if market_is_resolved and not mint_awarded:
+        for u2 in users.keys():
+            outstanding = sum(int(user_state[u2]["holdings"].get(t, 0)) for t in TOKS)
+            if outstanding > 0:
+                mint_points[u2] += outstanding * MINT_POINTS_PER_SHARE
+        mint_awarded = True  # (not strictly needed after loop)
+
+    # ---- Final PV/PnL snapshot (buy-price valuation) ----
+    prices = {t: float(buy_curve(int(reserves_state.get(t, 0)))) for t in TOKS}
+    rows = []
+    for uid, uname in users.items():
+        bal = float(user_state[uid]["balance"])
+        mv  = sum(int(user_state[uid]["holdings"].get(t, 0)) * prices[t] for t in TOKS)
+        pv  = bal + mv
+        pnl = pv - STARTING_BALANCE
+
+        rp_pts   = max(0.0, realised_profit_usd[uid]) * REALISED_PNL_POINTS_PER_USD
+        mint_pts = float(mint_points[uid])
+        total    = mint_pts + rp_pts
+
+        rows.append({
+            "user": uname,
+            "portfolio_value": pv,
+            "pnl": pnl,
+            "mint_points": mint_pts,
+            "realised_pnl_points": rp_pts,
+            "total_points": total,
+        })
+
+    return rows
+
 
 
 # ---- Helpers ----
@@ -568,127 +676,3 @@ def _token_set_for_market(db: Session, market_id: int) -> set[str]:
         if r and r.token
     }
     return toks
-
-
-# ---- Points + Leaderboard (market-aware) ----
-def compute_user_points(db: Session, market_id: Optional[int] = None):
-    """
-    If market_id is provided, computes points/portfolio strictly from that market's trades,
-    using that market's outcome tokens. Otherwise, computes globally (all tx, union of tokens).
-    """
-    # Load tx (optionally filtered) ordered by time
-    tx_q = db.query(Tx).order_by(Tx.ts.asc())
-    if market_id is not None:
-        tx_q = tx_q.filter(Tx.market_id == market_id)
-    tx = tx_q.all()
-
-    # Early exit: no trades
-    users = {u.id: u.username for u in db.query(User).all()}
-    if not tx:
-        # Return empty or everyone at baseline; choose baseline like before:
-        return [
-            {
-                "user": uname,
-                "portfolio_value": STARTING_BALANCE,
-                "pnl": 0.0,
-                "volume_points": 0.0,
-                "pnl_points": 0.0,
-                "total_points": 0.0,
-            }
-            for uid, uname in users.items()
-        ]
-
-    # Determine token universe
-    if market_id is not None:
-        TOKS = sorted(_token_set_for_market(db, market_id)) or []
-    else:
-        TOKS = sorted({r.token for r in tx if r.token})  # global union
-
-    # If still empty (defensive)
-    if not TOKS:
-        TOKS = []
-
-    # Volume points (phase depends on reserve BEFORE buy)
-    reserves_state = {t: 0 for t in TOKS}  # per-token circulating shares in THIS scope
-    vol_points = {uid: 0.0 for uid in users.keys()}
-
-    for r in tx:
-        t = r.token
-        if t not in reserves_state:
-            # unseen token (e.g., admin added later) -> add on the fly
-            reserves_state[t] = 0
-
-        if r.action == "Buy":
-            buy_usd = float(r.buy_delta or 0.0)
-            reserve_before = int(reserves_state[t])
-            if reserve_before < EARLY_QUANTITY_POINT:
-                mult = EARLY_MULTIPLIER
-            elif reserve_before < MID_QUANTITY_POINT:
-                mult = MID_MULTIPLIER
-            else:
-                mult = LATE_MULTIPLIER
-            vol_points[r.user_id] = vol_points.get(r.user_id, 0.0) + buy_usd * TRADE_POINTS_PER_USD * mult
-            reserves_state[t] = reserve_before + int(r.qty or 0)
-
-        elif r.action == "Sell":
-            sell_usd = float(r.sell_delta or 0.0)
-            vol_points[r.user_id] = vol_points.get(r.user_id, 0.0) + sell_usd * TRADE_POINTS_PER_USD
-            reserves_state[t] = int(reserves_state.get(t, 0)) - int(r.qty or 0)
-
-    # Rebuild latest portfolio snapshot (within this scope only)
-    reserves_state = {t: 0 for t in TOKS}
-    user_state = {
-        uid: {"balance": STARTING_BALANCE, "holdings": {t: 0 for t in TOKS}}
-        for uid in users.keys()
-    }
-
-    for r in tx:
-        t = r.token
-        if t not in reserves_state:
-            reserves_state[t] = 0
-            for s in user_state.values():
-                s["holdings"].setdefault(t, 0)
-
-        if r.action == "Buy":
-            reserves_state[t] += int(r.qty or 0)
-            usdc = float(r.buy_delta or 0.0)
-            u = user_state.setdefault(r.user_id, {"balance": STARTING_BALANCE, "holdings": {tt: 0 for tt in TOKS}})
-            u["balance"] -= usdc
-            u["holdings"][t] = int(u["holdings"].get(t, 0)) + int(r.qty or 0)
-
-        elif r.action == "Sell":
-            reserves_state[t] -= int(r.qty or 0)
-            usdc = float(r.sell_delta or 0.0)
-            u = user_state.setdefault(r.user_id, {"balance": STARTING_BALANCE, "holdings": {tt: 0 for tt in TOKS}})
-            u["balance"] += usdc
-            u["holdings"][t] = int(u["holdings"].get(t, 0)) - int(r.qty or 0)
-
-        elif r.action == "Resolve":
-            # payout credited in SellAmt_Delta for that user; wipe holdings & reserves for THIS scope
-            payout = float(r.sell_delta or 0.0)
-            u = user_state.setdefault(r.user_id, {"balance": STARTING_BALANCE, "holdings": {tt: 0 for tt in TOKS}})
-            u["balance"] += payout
-            for uu in user_state.values():
-                uu["holdings"] = {tt: 0 for tt in TOKS}
-            reserves_state = {tt: 0 for tt in TOKS}
-
-    # Price snapshot from buy curve using THIS scope reserves
-    prices = {t: float(buy_curve(int(reserves_state.get(t, 0)))) for t in TOKS}
-
-    rows = []
-    for uid, uname in users.items():
-        s = user_state.get(uid, {"balance": STARTING_BALANCE, "holdings": {t: 0 for t in TOKS}})
-        pv = float(s["balance"]) + sum(int(s["holdings"].get(t, 0)) * prices[t] for t in TOKS)
-        pnl = pv - STARTING_BALANCE
-        pnl_points = max(pnl, 0.0) * PNL_POINTS_PER_USD
-        vp = float(vol_points.get(uid, 0.0))
-        rows.append({
-            "user": uname,
-            "portfolio_value": pv,
-            "pnl": pnl,
-            "volume_points": vp,
-            "pnl_points": pnl_points,
-            "total_points": vp + pnl_points,
-        })
-
-    return rows
