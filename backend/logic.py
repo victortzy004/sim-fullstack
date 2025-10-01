@@ -248,7 +248,18 @@ def _allowed_tokens_for_market(db: Session, market_id: int) -> set[str]:
     ).scalars().all()
     return set(rows)
 
+
+def _canonical_token_for_market(db: Session, market_id: int, token_in: str) -> str | None:
+    """
+    Map arbitrary user-provided token text to the market's exact token (original case).
+    Returns None if the token does not exist in this market.
+    """
+    rows = db.query(MarketOutcome.token).filter(MarketOutcome.market_id == market_id).all()
+    lut = { (t or "").upper(): (t or "") for (t,) in rows }
+    return lut.get((token_in or "").strip().upper())
+
 # ---- Trading endpoints logic ----
+# 
 def do_trade(db: Session, user_id: int, token: str, market_id: int, side: str, mode: str, amount: float):
     # 0) Market must be active (single source of truth)
     m = db.get(Market, market_id)
@@ -256,20 +267,16 @@ def do_trade(db: Session, user_id: int, token: str, market_id: int, side: str, m
     if not ok:
         raise ValueError(f"Market not active: {why}")
 
-    # sanity check
-    # ensure_user_holdings_for_market(db, user_id, market_id)
-
     # 1) Basic input validation
-    # normalize token and validate against THIS market's outcomes
-    tok = (token or "").strip().upper()
-    side = side.lower().strip()
-    mode = mode.lower().strip()
+    side = (side or "").lower().strip()
+    mode = (mode or "").lower().strip()
 
-    allowed = _allowed_tokens_for_market(db, market_id)
-    if not allowed:
-        raise ValueError("Market has no configured outcome tokens.")
-    if tok not in allowed:
-        raise ValueError(f"Invalid token for market {market_id}. Allowed: {sorted(allowed)}")
+    # Canonicalize token to this market's exact casing
+    tok_canon = _canonical_token_for_market(db, market_id, token)
+    if not tok_canon:
+        allowed = list_market_outcomes(db, market_id)
+        raise ValueError(f"Invalid token for market {market_id}. Allowed: {allowed}")
+    tok_upper = tok_canon.upper()
 
     if side not in ("buy", "sell"):
         raise ValueError("Invalid side.")
@@ -285,28 +292,28 @@ def do_trade(db: Session, user_id: int, token: str, market_id: int, side: str, m
     if not user:
         raise ValueError("User not found.")
 
-   # 3) Load or create reserve for THIS market + token
+    # 3) Load or create reserve for THIS market + token (case-insensitive match)
     res = db.scalar(
         select(Reserve).where(
             Reserve.market_id == market_id,
-            Reserve.token == tok,
+            func.upper(Reserve.token) == tok_upper,   # <-- case-insensitive lookup
         )
     )
     if res is None:
-        res = Reserve(market_id=market_id, token=tok, shares=0, usdc=0.0)
+        res = Reserve(market_id=market_id, token=tok_canon, shares=0, usdc=0.0)  # <-- store canonical case
         db.add(res)
-        db.flush()  # gets res.id
+        db.flush()
 
-    # 4) Load or create holding row for (user, market, token)
+    # 4) Load or create holding row for (user, market, token) (case-insensitive match)
     hold = db.scalar(
         select(Holding).where(
             Holding.user_id == user_id,
             Holding.market_id == market_id,
-            Holding.token == tok,
+            func.upper(Holding.token) == tok_upper,   # <-- case-insensitive lookup
         )
     )
     if hold is None:
-        hold = Holding(user_id=user_id, market_id=market_id, token=tok, shares=0)
+        hold = Holding(user_id=user_id, market_id=market_id, token=tok_canon, shares=0)  # canonical
         db.add(hold)
         db.flush()
 
@@ -328,7 +335,6 @@ def do_trade(db: Session, user_id: int, token: str, market_id: int, side: str, m
     username = user.username
 
     if side == "buy":
-        # price & deltas based on current reserve
         buy_price, _, buy_amt_delta, _, _ = metrics_from_qty(reserve, qty)
         if user.balance < buy_amt_delta:
             raise ValueError("Insufficient balance.")
@@ -339,9 +345,10 @@ def do_trade(db: Session, user_id: int, token: str, market_id: int, side: str, m
         user.balance = float(user.balance) - float(buy_amt_delta)
         hold.shares = int(hold.shares) + qty
 
-        # tx log
+        # tx log (store canonical token)
         db.add(Tx(
-            ts=now_iso, user_id=user_id,market_id=market_id, user_name=username, action="Buy", token=token, qty=qty,
+            ts=now_iso, user_id=user_id, market_id=market_id, user_name=username,
+            action="Buy", token=tok_canon, qty=qty,
             buy_price=float(buy_price), buy_delta=float(buy_amt_delta),
             sell_price=None, sell_delta=None,
             balance_after=float(user.balance),
@@ -353,10 +360,8 @@ def do_trade(db: Session, user_id: int, token: str, market_id: int, side: str, m
         if int(hold.shares) < qty:
             raise ValueError("Insufficient shares to sell.")
 
-        # sell metrics use current reserve (before decrement)
         _, sell_price, _, sell_amt_delta, _ = metrics_from_qty(reserve, qty)
 
-        # Optionally guard: pool must have enough USDC (should be true by construction)
         if float(res.usdc) < float(sell_amt_delta) - 1e-9:
             raise ValueError("Insufficient pool liquidity.")
 
@@ -366,16 +371,17 @@ def do_trade(db: Session, user_id: int, token: str, market_id: int, side: str, m
         user.balance = float(user.balance) + float(sell_amt_delta)
         hold.shares = int(hold.shares) - qty
 
-        # tx log
+        # tx log (store canonical token)
         db.add(Tx(
-            ts=now_iso, user_id=user_id, market_id=market_id, user_name=username, action="Sell", token=token, qty=qty,
+            ts=now_iso, user_id=user_id, market_id=market_id, user_name=username,
+            action="Sell", token=tok_canon, qty=qty,
             buy_price=None, buy_delta=None,
             sell_price=float(sell_price), sell_delta=float(sell_amt_delta),
             balance_after=float(user.balance),
         ))
         db.commit()
         return {"status": "ok", "qty": qty, "proceeds": float(sell_amt_delta), "price": float(sell_price)}
-
+    
 # Preview trade outcome
 def preview_for_side_mode(
     reserve: int,
