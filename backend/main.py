@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import secrets, os
 from textwrap import dedent
 from dotenv import load_dotenv, find_dotenv
+from collections import defaultdict
 
 from .db import Base, engine, get_db
 from .models import User, Market, Reserve, Holding, Tx, MarketOutcome
@@ -793,14 +794,75 @@ def admin_configure(
 
 
 # ====== Market ======
-@app.get("/markets",
-         response_model=List[MarketOut],
-         tags=["Market"], summary="List all markets")
-def list_markets(db: Session = Depends(get_db)):
-    """Return all markets (without reserves for brevity)."""
-    ms = db.query(Market).order_by(Market.id.asc()).all()
-    return [_market_to_out(db, m) for m in ms]
+# @app.get("/markets",
+#          response_model=List[MarketOut],
+#          tags=["Market"], summary="List all markets")
+# def list_markets(db: Session = Depends(get_db)):
+#     """Return all markets (without reserves for brevity)."""
+#     ms = db.query(Market).order_by(Market.id.asc()).all()
+#     return [_market_to_out(db, m) for m in ms]
 
+@app.get(
+    "/markets",
+    response_model=List[MarketWithReservesOut],
+    tags=["Market"],
+    summary="List all markets (with outcomes & reserves)"
+)
+def list_markets(db: Session = Depends(get_db)):
+    """Return all markets with outcomes (token/display/sort_order) and reserves."""
+    ms = db.query(Market).order_by(Market.id.asc()).all()
+    if not ms:
+        return []
+
+    market_ids = [m.id for m in ms]
+
+    # Batch fetch outcomes for all markets; preserve sort_order asc then token asc
+    mo_rows = (
+        db.query(MarketOutcome)
+          .filter(MarketOutcome.market_id.in_(market_ids))
+          .order_by(MarketOutcome.market_id.asc(),
+                    MarketOutcome.sort_order.asc(),
+                    MarketOutcome.token.asc())
+          .all()
+    )
+    outcomes_by_mid = defaultdict(list)
+    for o in mo_rows:
+        outcomes_by_mid[o.market_id].append(
+            OutcomeOut(
+                token=o.token,
+                display=o.display,
+                sort_order=int(o.sort_order or 0),
+            )
+        )
+
+    # Batch fetch reserves for all markets
+    res_rows = (
+        db.query(Reserve)
+          .filter(Reserve.market_id.in_(market_ids))
+          .all()
+    )
+    reserves_by_mid = defaultdict(list)
+    for r in res_rows:
+        reserves_by_mid[r.market_id].append(r)  # your schema already accepts this model instance
+
+    # Build full outputs
+    out: List[MarketWithReservesOut] = []
+    for m in ms:
+        out.append(
+            MarketWithReservesOut(
+                id=m.id,
+                start_ts=m.start_ts,
+                end_ts=m.end_ts,
+                winner_token=m.winner_token,
+                resolved=m.resolved,
+                resolved_ts=m.resolved_ts,
+                question=m.question or "",
+                resolution_note=m.resolution_note or "",
+                outcomes=outcomes_by_mid.get(m.id, []),
+                reserves=reserves_by_mid.get(m.id, []),
+            )
+        )
+    return out
 
 @app.get("/market/{market_id}",
          response_model=MarketWithReservesOut,
