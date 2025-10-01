@@ -419,44 +419,59 @@ def preview_for_side_mode(
         "sell_tax_rate_used": float(tax_used),
     }
 
-# Token ownership breakdown
+def _canonical_token_for_market(db: Session, market_id: int, token_in: str) -> str | None:
+    """Return the exact-cased token configured for this market, matching token_in case-insensitively."""
+    toks = list_market_outcomes(db, market_id)  # e.g. ["Bilibili Gaming", "Others", ...]
+    lut = {t.upper(): t for t in toks}
+    return lut.get((token_in or "").strip().upper())
+
+
+# Token ownership breakdown (case-insensitive, canonicalized)
 def ownership_breakdown(
     db: Session,
     market_id: int,
     token: str,
     *,
-    min_shares: int = 1,               # exclude 0-share rows by default
-    limit: Optional[int] = None,       # top-N holders
-    order: str = "desc",               # "desc" (largest first) or "asc"
+    min_shares: int = 1,
+    limit: Optional[int] = None,
+    order: str = "desc",
 ) -> Dict[str, Any]:
-    token = (token or "").strip().upper()
-
-    # 1) Validate token against canonical outcomes for THIS market
-    valid = list_market_outcomes(db, market_id)
-    if token not in valid:
-        # keep it logic-layer agnostic; let the endpoint raise HTTPException
+    # 1) Canonicalize token for THIS market (preserve the original-case string for output)
+    token_canon = _canonical_token_for_market(db, market_id, token)
+    if not token_canon:
+        valid = list_market_outcomes(db, market_id)
         return {
             "market_id": market_id,
-            "token": token,
+            "token": (token or "").strip(),
             "total_shares": 0,
             "holders": [],
             "error": "invalid-token",
             "valid_tokens": valid,
         }
 
-    # 2) Total outstanding shares for this market+token (denominator for pct)
-    total_shares = int(db.query(func.coalesce(func.sum(Holding.shares), 0))
-                         .filter(Holding.market_id == market_id,
-                                 Holding.token == token,
-                                 Holding.shares > 0)
-                         .scalar() or 0)
+    token_upper = token_canon.upper()
+
+    # 2) Total outstanding shares (case-insensitive match in SQL)
+    total_shares = int(
+        db.query(func.coalesce(func.sum(Holding.shares), 0))
+          .filter(
+              Holding.market_id == market_id,
+              func.upper(Holding.token) == token_upper,
+              Holding.shares > 0,
+          )
+          .scalar() or 0
+    )
 
     # 3) Pull holders with optional threshold/limit and ordering
-    q = (db.query(Holding.user_id, User.username, Holding.shares)
-           .join(User, User.id == Holding.user_id)
-           .filter(Holding.market_id == market_id,
-                   Holding.token == token,
-                   Holding.shares >= (min_shares if min_shares is not None else 0)))
+    q = (
+        db.query(Holding.user_id, User.username, Holding.shares)
+          .join(User, User.id == Holding.user_id)
+          .filter(
+              Holding.market_id == market_id,
+              func.upper(Holding.token) == token_upper,
+              Holding.shares >= (min_shares if min_shares is not None else 0),
+          )
+    )
 
     if order == "asc":
         q = q.order_by(Holding.shares.asc(), User.username.asc())
@@ -475,15 +490,80 @@ def ownership_breakdown(
             "user_id": int(uid),
             "username": uname,
             "shares": int(sh),
-            "share_pct": float(pct), # percentage
+            "share_pct": float(pct),
         })
 
     return {
         "market_id": market_id,
-        "token": token,
+        "token": token_canon,          # return the human/original-case token
         "total_shares": int(total_shares),
         "holders": holders,
     }
+# # Token ownership breakdown
+# def ownership_breakdown(
+#     db: Session,
+#     market_id: int,
+#     token: str,
+#     *,
+#     min_shares: int = 1,               # exclude 0-share rows by default
+#     limit: Optional[int] = None,       # top-N holders
+#     order: str = "desc",               # "desc" (largest first) or "asc"
+# ) -> Dict[str, Any]:
+#     token = (token or "").strip().upper()
+
+#     # 1) Validate token against canonical outcomes for THIS market
+#     valid = list_market_outcomes(db, market_id)
+#     if token not in valid:
+#         # keep it logic-layer agnostic; let the endpoint raise HTTPException
+#         return {
+#             "market_id": market_id,
+#             "token": token,
+#             "total_shares": 0,
+#             "holders": [],
+#             "error": "invalid-token",
+#             "valid_tokens": valid,
+#         }
+
+#     # 2) Total outstanding shares for this market+token (denominator for pct)
+#     total_shares = int(db.query(func.coalesce(func.sum(Holding.shares), 0))
+#                          .filter(Holding.market_id == market_id,
+#                                  Holding.token == token,
+#                                  Holding.shares > 0)
+#                          .scalar() or 0)
+
+#     # 3) Pull holders with optional threshold/limit and ordering
+#     q = (db.query(Holding.user_id, User.username, Holding.shares)
+#            .join(User, User.id == Holding.user_id)
+#            .filter(Holding.market_id == market_id,
+#                    Holding.token == token,
+#                    Holding.shares >= (min_shares if min_shares is not None else 0)))
+
+#     if order == "asc":
+#         q = q.order_by(Holding.shares.asc(), User.username.asc())
+#     else:
+#         q = q.order_by(Holding.shares.desc(), User.username.asc())
+
+#     if limit:
+#         q = q.limit(int(limit))
+
+#     rows = q.all()
+
+#     holders: List[Dict[str, Any]] = []
+#     for uid, uname, sh in rows:
+#         pct = (float(sh) / float(total_shares)) if total_shares > 0 else 0.0
+#         holders.append({
+#             "user_id": int(uid),
+#             "username": uname,
+#             "shares": int(sh),
+#             "share_pct": float(pct), # percentage
+#         })
+
+#     return {
+#         "market_id": market_id,
+#         "token": token,
+#         "total_shares": int(total_shares),
+#         "holders": holders,
+#     }
 
 # # ---- Points + Leaderboard helpers (same math as app) ----
 def compute_user_points(db: Session, market_id: Optional[int] = None):

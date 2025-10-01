@@ -221,6 +221,13 @@ def _enrich_holdings_with_prices(
     return out
 
 
+def _canonical_token_for_market(db: Session, market_id: int, token_in: str) -> str | None:
+    """Return the exact-cased token configured for this market, matching token_in case-insensitively."""
+    toks = list_market_outcomes(db, market_id)  # e.g. ["Bilibili Gaming", "Others", ...]
+    lut = {t.upper(): t for t in toks}
+    return lut.get((token_in or "").strip().upper())
+
+
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(bind=engine)
@@ -827,6 +834,39 @@ def get_market(market_id: int, db: Session = Depends(get_db)):
     )
 
 # Token user ownership breakdown
+# @app.get(
+#     "/market/{market_id}/ownership/{token}",
+#     response_model=OwnershipBreakdownOut,
+#     tags=["Market"],
+#     summary="Ownership breakdown for a market outcome",
+#     description="Returns holders (user_id, username, shares, share_pct) for the given market and token.",
+# )
+# def get_ownership_breakdown(
+#     market_id: int,
+#     token: str,
+#     min_shares: int = Query(1, ge=0, description="Minimum shares to be included (default 1, set 0 to include all)"),
+#     limit: Optional[int] = Query(None, ge=1, le=10000, description="Optional top-N holders"),
+#     order: Literal["desc", "asc"] = Query("desc", description="Sort by shares"),
+#     db: Session = Depends(get_db),
+# ):
+#     token = token.strip().upper()
+
+#     # Validate token here to return a proper HTTP 400
+#     valid = list_market_outcomes(db, market_id)
+#     if token not in valid:
+#         raise HTTPException(status_code=400, detail=f"Invalid token for market {market_id}. Valid: {valid}")
+
+#     data = ownership_breakdown(
+#         db, market_id, token,
+#         min_shares=min_shares,
+#         limit=limit,
+#         order=order,
+#     )
+
+#     # The logic() returns a plain dict; it already matches the response model shape.
+#     return data
+
+# Token user ownership breakdown
 @app.get(
     "/market/{market_id}/ownership/{token}",
     response_model=OwnershipBreakdownOut,
@@ -842,21 +882,18 @@ def get_ownership_breakdown(
     order: Literal["desc", "asc"] = Query("desc", description="Sort by shares"),
     db: Session = Depends(get_db),
 ):
-    token = token.strip().upper()
-
-    # Validate token here to return a proper HTTP 400
-    valid = list_market_outcomes(db, market_id)
-    if token not in valid:
+    # resolve canonical token for this market (case-insensitive)
+    token_canonical = _canonical_token_for_market(db, market_id, token)
+    if not token_canonical:
+        valid = list_market_outcomes(db, market_id)
         raise HTTPException(status_code=400, detail=f"Invalid token for market {market_id}. Valid: {valid}")
 
     data = ownership_breakdown(
-        db, market_id, token,
+        db, market_id, token_canonical,
         min_shares=min_shares,
         limit=limit,
         order=order,
     )
-
-    # The logic() returns a plain dict; it already matches the response model shape.
     return data
 
 
@@ -1009,11 +1046,7 @@ def leaderboard(
 #     now = datetime.utcnow().isoformat()
 #     return [{"ts": now, "user": r["user"], "total_points": r["total_points"]} for r in rows]
 
-def _canonical_token_for_market(db: Session, market_id: int, token_in: str) -> str | None:
-    """Return the exact-cased token configured for this market, matching token_in case-insensitively."""
-    toks = list_market_outcomes(db, market_id)  # e.g. ["Bilibili Gaming", "Others", ...]
-    lut = {t.upper(): t for t in toks}
-    return lut.get((token_in or "").strip().upper())
+
 
 @app.post("/preview/{market_id}/{token}",
           response_model=PreviewResponse,
