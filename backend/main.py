@@ -1009,6 +1009,11 @@ def leaderboard(
 #     now = datetime.utcnow().isoformat()
 #     return [{"ts": now, "user": r["user"], "total_points": r["total_points"]} for r in rows]
 
+def _canonical_token_for_market(db: Session, market_id: int, token_in: str) -> str | None:
+    """Return the exact-cased token configured for this market, matching token_in case-insensitively."""
+    toks = list_market_outcomes(db, market_id)  # e.g. ["Bilibili Gaming", "Others", ...]
+    lut = {t.upper(): t for t in toks}
+    return lut.get((token_in or "").strip().upper())
 
 @app.post("/preview/{market_id}/{token}",
           response_model=PreviewResponse,
@@ -1020,16 +1025,20 @@ def preview_metrics(
     req: PreviewRequest,
     db: Session = Depends(get_db),
 ):
-    token = token.strip().upper()
+    # resolve canonical token for this market (case-insensitive)
+    token_canonical = _canonical_token_for_market(db, market_id, token)
+    if not token_canonical:
+        valid = list_market_outcomes(db, market_id)
+        raise HTTPException(status_code=400, detail=f"Invalid token for market {market_id}. Valid: {valid}")
 
-    # validate against THIS market's outcomes
-    if token not in list_market_outcomes(db, market_id):
-        raise HTTPException(status_code=400, detail=f"Invalid token for market {market_id}")
-
+    # fetch reserve using case-insensitive match, or use canonical value
     r = (
         db.query(Reserve)
-        .filter(Reserve.market_id == market_id, Reserve.token == token)
-        .first()
+          .filter(
+              Reserve.market_id == market_id,
+              func.upper(Reserve.token) == token_canonical.upper(),  # robust to casing
+          )
+          .first()
     )
     if not r:
         raise HTTPException(status_code=404, detail="Reserve not found for this market/token")
@@ -1045,7 +1054,7 @@ def preview_metrics(
 
     return PreviewResponse(
         market_id=market_id,
-        token=token,
+        token=token_canonical,  # return the canonical outcome name
         reserve=reserve,
         quantity=res["quantity"],
         new_reserve=res["new_reserve"],
