@@ -336,6 +336,155 @@ def join_or_load_user(payload: UserCreate, db: Session = Depends(get_db)):
 
 # ====== Admin ======
 # Start new market
+# @app.post("/admin/{market_id}/start", response_model=MarketOut,
+#           tags=["Admin"], summary="Start market",
+#           description="Starts a market. Requires admin password in body.")
+# def admin_start(
+#     market_id: int,
+#     req: AdminStartRequest = Body(...),
+#     db: Session = Depends(get_db),
+# ):
+#     _assert_admin(req.password)
+    
+#     # ---- 1) Read requested outcomes (support legacy "tokens")
+#     requested = None
+#     if getattr(req, "outcomes", None):
+#         requested = req.outcomes
+#     elif getattr(req, "tokens", None):
+#         requested = req.tokens
+
+
+#     if requested:
+#         # trim & keep order unique
+#         desired = []
+#         seen = set()
+#         for t in requested:
+#             if not t:
+#                 continue
+#             tok = t.strip()
+#             if not tok:
+#                 continue
+#             if tok not in seen:
+#                 desired.append(tok)   # keep exact case for display
+#                 seen.add(tok)
+#         if not desired:
+#             raise HTTPException(400, detail="At least one outcome required.")
+#     else:
+#         desired = None  # decide below
+
+#     # normalize/validate outcomes
+#     if req.outcomes and len(req.outcomes) > 0:
+#         desired_outcomes = [t.strip().upper() for t in req.outcomes if t and t.strip()]
+#         desired_outcomes = list(dict.fromkeys(desired_outcomes))  # unique, keep order
+#         if len(desired_outcomes) == 0:
+#             raise HTTPException(status_code=400, detail="At least one outcome required")
+#     else:
+#         desired_outcomes = None  # means: keep existing if any, else use DEFAULT_OUTCOMES
+
+#     now = _now_iso()
+#     if getattr(req, "end_ts", None):
+#         try:
+#             end_iso = parse_to_naive_utc(req.end_ts)  # normalizes to UTC-naive "YYYY-MM-DDTHH:MM:SS"
+#         except Exception:
+#             raise HTTPException(status_code=400, detail="Invalid end_ts (expect ISO-8601, e.g. '2026-06-30T12:00:00Z')")
+#         if datetime.fromisoformat(end_iso) <= datetime.fromisoformat(now):
+#             raise HTTPException(status_code=400, detail="end_ts must be strictly after current UTC time")
+#     else:
+#         # fallback to duration_days or default MARKET_DURATION_DAYS
+#         end_iso = (datetime.utcnow() + timedelta(days=(req.duration_days or MARKET_DURATION_DAYS)))\
+#                     .replace(microsecond=0).isoformat()
+    
+
+
+#     m = db.get(Market, market_id)
+#     if not m:
+#         m = Market(
+#             id=market_id,
+#             start_ts=now,
+#             end_ts=end_iso,
+#             winner_token=None,
+#             resolved=0,
+#             resolved_ts=None,
+#             question=req.question,
+#             resolution_note=req.resolution_note,
+#         )
+#         db.add(m)
+#         db.flush()  # ensure m.id exists for reserves
+#     else:
+#         if is_market_active(m):
+#             raise HTTPException(status_code=400, detail="Market already active.")
+#         m.start_ts = now
+#         m.end_ts = end_iso
+#         m.winner_token = None
+#         m.resolved = 0
+#         m.resolved_ts = None
+#         # update meta if provided (leave unchanged if omitted)
+#         if req.question is not None:
+#             m.question = req.question
+#         if req.resolution_note is not None:
+#             m.resolution_note = req.resolution_note
+
+#  # ---- determine final desired outcome list
+#     # first, see what we already have in MarketOutcome for this market
+#     existing_mo = db.execute(
+#         select(MarketOutcome).where(MarketOutcome.market_id == market_id)
+#     ).scalars().all()
+#     existing_tokens = [mo.token for mo in existing_mo]
+
+#     if desired is None:
+#         desired = existing_tokens if existing_tokens else list(DEFAULT_OUTCOMES)
+
+#     desired_set = set(desired)
+#     existing_set = set(existing_tokens)
+
+#     # ---- delete outcomes that are no longer desired
+#     for tok in (existing_set - desired_set):
+#         db.query(MarketOutcome).filter(
+#             MarketOutcome.market_id == market_id,
+#             MarketOutcome.token == tok
+#         ).delete(synchronize_session=False)
+#         # keep or delete reserves for removed tokens; since we’re “starting” a market, safe to remove:
+#         db.query(Reserve).filter(
+#             Reserve.market_id == market_id,
+#             Reserve.token == tok
+#         ).delete(synchronize_session=False)
+
+#     # ---- insert/update desired outcomes (preserve order via sort_order)
+#     for i, tok in enumerate(desired):
+#         mo = db.query(MarketOutcome).filter(
+#             MarketOutcome.market_id == market_id,
+#             MarketOutcome.token == tok
+#         ).first()
+#         if not mo:
+#             db.add(MarketOutcome(
+#                 market_id=market_id,
+#                 token=tok,
+#                 display=tok,      # or req-provided display if you add it
+#                 sort_order=i
+#             ))
+#         else:
+#             mo.sort_order = i
+#             # optionally update display name:
+#             # mo.display = tok
+
+#     # ---- ensure reserves exist for each desired token (and only those)
+#     for tok in desired:
+#         r = db.query(Reserve).filter(
+#             Reserve.market_id == market_id,
+#             Reserve.token == tok
+#         ).first()
+#         if not r:
+#             db.add(Reserve(market_id=market_id, token=tok, shares=0, usdc=0.0))
+
+#     if req.reset_reserves:
+#         db.query(Reserve).filter(Reserve.market_id == market_id).update(
+#             {Reserve.shares: 0, Reserve.usdc: 0.0},
+#             synchronize_session=False
+#         )
+
+#     db.commit()
+#     db.refresh(m)
+#     return _market_to_out(db, m)
 @app.post("/admin/{market_id}/start", response_model=MarketOut,
           tags=["Admin"], summary="Start market",
           description="Starts a market. Requires admin password in body.")
@@ -345,62 +494,56 @@ def admin_start(
     db: Session = Depends(get_db),
 ):
     _assert_admin(req.password)
-    
-    # ---- 1) Read requested outcomes (support legacy "tokens")
+
+    # ---- 1) Resolve desired outcomes (support legacy 'tokens')
     requested = None
     if getattr(req, "outcomes", None):
         requested = req.outcomes
     elif getattr(req, "tokens", None):
         requested = req.tokens
 
-
     if requested:
-        # trim & keep order unique
-        desired = []
-        seen = set()
+        # unique by UPPER(), preserve first occurrence casing for display
+        desired: list[str] = []
+        seen_upper: set[str] = set()
         for t in requested:
             if not t:
                 continue
             tok = t.strip()
             if not tok:
                 continue
-            if tok not in seen:
-                desired.append(tok)   # keep exact case for display
-                seen.add(tok)
+            u = tok.upper()
+            if u in seen_upper:
+                continue
+            desired.append(tok)
+            seen_upper.add(u)
         if not desired:
-            raise HTTPException(400, detail="At least one outcome required.")
+            raise HTTPException(status_code=400, detail="At least one outcome required.")
     else:
         desired = None  # decide below
 
-    # normalize/validate outcomes
-    if req.outcomes and len(req.outcomes) > 0:
-        desired_outcomes = [t.strip().upper() for t in req.outcomes if t and t.strip()]
-        desired_outcomes = list(dict.fromkeys(desired_outcomes))  # unique, keep order
-        if len(desired_outcomes) == 0:
-            raise HTTPException(status_code=400, detail="At least one outcome required")
-    else:
-        desired_outcomes = None  # means: keep existing if any, else use DEFAULT_OUTCOMES
-
-    now = _now_iso()
+    # ---- 2) Compute start/end timestamps
+    now_iso = _now_iso()
     if getattr(req, "end_ts", None):
         try:
-            end_iso = parse_to_naive_utc(req.end_ts)  # normalizes to UTC-naive "YYYY-MM-DDTHH:MM:SS"
+            end_iso = parse_to_naive_utc(req.end_ts)
         except Exception:
-            raise HTTPException(status_code=400, detail="Invalid end_ts (expect ISO-8601, e.g. '2026-06-30T12:00:00Z')")
-        if datetime.fromisoformat(end_iso) <= datetime.fromisoformat(now):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid end_ts (expect ISO-8601, e.g. '2026-06-30T12:00:00Z')",
+            )
+        if datetime.fromisoformat(end_iso) <= datetime.fromisoformat(now_iso):
             raise HTTPException(status_code=400, detail="end_ts must be strictly after current UTC time")
     else:
-        # fallback to duration_days or default MARKET_DURATION_DAYS
         end_iso = (datetime.utcnow() + timedelta(days=(req.duration_days or MARKET_DURATION_DAYS)))\
                     .replace(microsecond=0).isoformat()
-    
 
-
+    # ---- 3) Upsert market meta & (re)activate
     m = db.get(Market, market_id)
     if not m:
         m = Market(
             id=market_id,
-            start_ts=now,
+            start_ts=now_iso,
             end_ts=end_iso,
             winner_token=None,
             resolved=0,
@@ -409,78 +552,87 @@ def admin_start(
             resolution_note=req.resolution_note,
         )
         db.add(m)
-        db.flush()  # ensure m.id exists for reserves
+        db.flush()
     else:
         if is_market_active(m):
             raise HTTPException(status_code=400, detail="Market already active.")
-        m.start_ts = now
+        m.start_ts = now_iso
         m.end_ts = end_iso
         m.winner_token = None
         m.resolved = 0
         m.resolved_ts = None
-        # update meta if provided (leave unchanged if omitted)
         if req.question is not None:
             m.question = req.question
         if req.resolution_note is not None:
             m.resolution_note = req.resolution_note
 
- # ---- determine final desired outcome list
-    # first, see what we already have in MarketOutcome for this market
-    existing_mo = db.execute(
-        select(MarketOutcome).where(MarketOutcome.market_id == market_id)
-    ).scalars().all()
+    # ---- 4) Determine final desired outcomes (use existing or defaults if none provided)
+    existing_mo = db.query(MarketOutcome).filter(MarketOutcome.market_id == market_id).all()
     existing_tokens = [mo.token for mo in existing_mo]
 
     if desired is None:
         desired = existing_tokens if existing_tokens else list(DEFAULT_OUTCOMES)
 
-    desired_set = set(desired)
-    existing_set = set(existing_tokens)
+    upper_desired  = {t.upper() for t in desired}
+    upper_existing = {t.upper() for t in existing_tokens}
 
-    # ---- delete outcomes that are no longer desired
-    for tok in (existing_set - desired_set):
+    # ---- 5) Remove outcomes no longer desired (and scrub reserves & holdings for those tokens)
+    for tok_upper in (upper_existing - upper_desired):
         db.query(MarketOutcome).filter(
             MarketOutcome.market_id == market_id,
-            MarketOutcome.token == tok
-        ).delete(synchronize_session=False)
-        # keep or delete reserves for removed tokens; since we’re “starting” a market, safe to remove:
-        db.query(Reserve).filter(
-            Reserve.market_id == market_id,
-            Reserve.token == tok
+            func.upper(MarketOutcome.token) == tok_upper
         ).delete(synchronize_session=False)
 
-    # ---- insert/update desired outcomes (preserve order via sort_order)
+        db.query(Reserve).filter(
+            Reserve.market_id == market_id,
+            func.upper(Reserve.token) == tok_upper
+        ).delete(synchronize_session=False)
+
+        db.query(Holding).filter(
+            Holding.market_id == market_id,
+            func.upper(Holding.token) == tok_upper
+        ).delete(synchronize_session=False)
+
+    # ---- 6) Insert/update desired outcomes (preserve order via sort_order)
     for i, tok in enumerate(desired):
         mo = db.query(MarketOutcome).filter(
             MarketOutcome.market_id == market_id,
-            MarketOutcome.token == tok
+            func.upper(MarketOutcome.token) == tok.upper()
         ).first()
         if not mo:
             db.add(MarketOutcome(
                 market_id=market_id,
                 token=tok,
-                display=tok,      # or req-provided display if you add it
+                display=tok,
                 sort_order=i
             ))
         else:
             mo.sort_order = i
-            # optionally update display name:
-            # mo.display = tok
+            if not mo.display:
+                mo.display = tok  # normalize display if previously empty
 
-    # ---- ensure reserves exist for each desired token (and only those)
+    # ---- 7) Ensure reserves exist for each desired token (case-insensitive) and normalize casing
     for tok in desired:
         r = db.query(Reserve).filter(
             Reserve.market_id == market_id,
-            Reserve.token == tok
+            func.upper(Reserve.token) == tok.upper()
         ).first()
         if not r:
             db.add(Reserve(market_id=market_id, token=tok, shares=0, usdc=0.0))
+        else:
+            # normalize canonical casing to match `tok`
+            if r.token != tok:
+                r.token = tok
 
-    if req.reset_reserves:
+    # Optionally zero reserves (shares/usdc) if requested
+    if getattr(req, "reset_reserves", False):
         db.query(Reserve).filter(Reserve.market_id == market_id).update(
             {Reserve.shares: 0, Reserve.usdc: 0.0},
             synchronize_session=False
         )
+
+    # ---- 8) Wipe ALL holdings for this market to prevent carry-over between seasons
+    db.query(Holding).filter(Holding.market_id == market_id).delete(synchronize_session=False)
 
     db.commit()
     db.refresh(m)
