@@ -6,10 +6,6 @@ from sqlalchemy import select, func
 from .models import User, Market, Reserve, Holding, Tx, MarketOutcome
 
 
-# To-do:
-# 1. replace search function for input size
-# 
-
 # ---- Constants (match your Streamlit app) ----
 BASE_EPSILON = 1e-4
 MARKET_DURATION_DAYS = 5
@@ -231,7 +227,6 @@ def list_market_outcomes(db: Session, market_id: int) -> list[str]:
                    .all()
     ]
 
-
 def ensure_user_holdings_for_market(db: Session, user_id: int, market_id: int):
     existing = {
         (h.token)
@@ -242,13 +237,7 @@ def ensure_user_holdings_for_market(db: Session, user_id: int, market_id: int):
             db.add(Holding(user_id=user_id, market_id=market_id, token=token, shares=0))
     db.flush
 
-def _allowed_tokens_for_market(db: Session, market_id: int) -> set[str]:
-    rows = db.execute(
-        select(func.upper(MarketOutcome.token)).where(MarketOutcome.market_id == market_id)
-    ).scalars().all()
-    return set(rows)
-
-
+# ---- Helpers ----
 def _canonical_token_for_market(db: Session, market_id: int, token_in: str) -> str | None:
     """
     Map arbitrary user-provided token text to the market's exact token (original case).
@@ -257,6 +246,23 @@ def _canonical_token_for_market(db: Session, market_id: int, token_in: str) -> s
     rows = db.query(MarketOutcome.token).filter(MarketOutcome.market_id == market_id).all()
     lut = { (t or "").upper(): (t or "") for (t,) in rows }
     return lut.get((token_in or "").strip().upper())
+
+def _token_set_for_market(db: Session, market_id: int) -> set[str]:
+    """Prefer tokens from reserves for this market; fallback to tokens in tx."""
+    toks = {
+        r.token
+        for r in db.query(Reserve).filter(Reserve.market_id == market_id).all()
+        if r.token
+    }
+    if toks:
+        return toks
+    # fallback: from tx rows
+    toks = {
+        r.token
+        for r in db.query(Tx.token).filter(Tx.market_id == market_id).all()
+        if r and r.token
+    }
+    return toks
 
 # ---- Trading endpoints logic ----
 # 
@@ -505,71 +511,7 @@ def ownership_breakdown(
         "total_shares": int(total_shares),
         "holders": holders,
     }
-# # Token ownership breakdown
-# def ownership_breakdown(
-#     db: Session,
-#     market_id: int,
-#     token: str,
-#     *,
-#     min_shares: int = 1,               # exclude 0-share rows by default
-#     limit: Optional[int] = None,       # top-N holders
-#     order: str = "desc",               # "desc" (largest first) or "asc"
-# ) -> Dict[str, Any]:
-#     token = (token or "").strip().upper()
 
-#     # 1) Validate token against canonical outcomes for THIS market
-#     valid = list_market_outcomes(db, market_id)
-#     if token not in valid:
-#         # keep it logic-layer agnostic; let the endpoint raise HTTPException
-#         return {
-#             "market_id": market_id,
-#             "token": token,
-#             "total_shares": 0,
-#             "holders": [],
-#             "error": "invalid-token",
-#             "valid_tokens": valid,
-#         }
-
-#     # 2) Total outstanding shares for this market+token (denominator for pct)
-#     total_shares = int(db.query(func.coalesce(func.sum(Holding.shares), 0))
-#                          .filter(Holding.market_id == market_id,
-#                                  Holding.token == token,
-#                                  Holding.shares > 0)
-#                          .scalar() or 0)
-
-#     # 3) Pull holders with optional threshold/limit and ordering
-#     q = (db.query(Holding.user_id, User.username, Holding.shares)
-#            .join(User, User.id == Holding.user_id)
-#            .filter(Holding.market_id == market_id,
-#                    Holding.token == token,
-#                    Holding.shares >= (min_shares if min_shares is not None else 0)))
-
-#     if order == "asc":
-#         q = q.order_by(Holding.shares.asc(), User.username.asc())
-#     else:
-#         q = q.order_by(Holding.shares.desc(), User.username.asc())
-
-#     if limit:
-#         q = q.limit(int(limit))
-
-#     rows = q.all()
-
-#     holders: List[Dict[str, Any]] = []
-#     for uid, uname, sh in rows:
-#         pct = (float(sh) / float(total_shares)) if total_shares > 0 else 0.0
-#         holders.append({
-#             "user_id": int(uid),
-#             "username": uname,
-#             "shares": int(sh),
-#             "share_pct": float(pct), # percentage
-#         })
-
-#     return {
-#         "market_id": market_id,
-#         "token": token,
-#         "total_shares": int(total_shares),
-#         "holders": holders,
-#     }
 
 # # ---- Points + Leaderboard helpers (same math as app) ----
 def compute_user_points(db: Session, market_id: Optional[int] = None):
@@ -744,21 +686,4 @@ def compute_user_points(db: Session, market_id: Optional[int] = None):
 
 
 
-# ---- Helpers ----
 
-def _token_set_for_market(db: Session, market_id: int) -> set[str]:
-    """Prefer tokens from reserves for this market; fallback to tokens in tx."""
-    toks = {
-        r.token
-        for r in db.query(Reserve).filter(Reserve.market_id == market_id).all()
-        if r.token
-    }
-    if toks:
-        return toks
-    # fallback: from tx rows
-    toks = {
-        r.token
-        for r in db.query(Tx.token).filter(Tx.market_id == market_id).all()
-        if r and r.token
-    }
-    return toks
