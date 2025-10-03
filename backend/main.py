@@ -11,7 +11,7 @@ from collections import defaultdict
 from .db import Base, engine, get_db
 from .models import User, Market, Reserve, Holding, Tx, MarketOutcome
 from .schemas import *
-from .logic import do_trade, buy_curve, compute_user_points, is_market_active, parse_to_naive_utc, ownership_breakdown, preview_for_side_mode, list_market_outcomes, STARTING_BALANCE, MARKET_DURATION_DAYS, TOKENS
+from .logic import do_trade, buy_curve, compute_user_points, is_market_active, parse_to_naive_utc, ownership_breakdown, preview_for_side_mode, list_market_outcomes, STARTING_BALANCE, SPECIAL_STARTING_BALANCE, MARKET_DURATION_DAYS, TOKENS
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -325,7 +325,8 @@ def join_or_load_user(payload: UserCreate, db: Session = Depends(get_db)):
         return UserOut(id=user.id, username=user.username, balance=user.balance)
 
     # create new
-    user = User(username=uname, balance=STARTING_BALANCE, created_at=func.now())
+    balance = SPECIAL_STARTING_BALANCE if uname == 'jack' else STARTING_BALANCE
+    user = User(username=uname, balance=balance, created_at=func.now())
     db.add(user)
     db.flush()  # gets user.id
 
