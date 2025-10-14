@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, Body, status, Path, Query, Response
 from sqlalchemy.orm import Session
-from sqlalchemy import func, select
+from sqlalchemy import func, select, delete
 from typing import List, Annotated
 from datetime import datetime, timedelta
 import secrets, os
@@ -490,67 +490,111 @@ def admin_start(
     return _market_to_out(db, m)
 
 
-# Admin market reset (makes market active)
 @app.post(
-    "/admin/{market_id}/reset",
+    "/admin/{market_id}/delete",
     tags=["Admin"],
-    summary="Reset one market/users",
-    description="Resets a market (and optionally users). Requires admin password in body."
+    summary="DELETE one market and all its data",
+    description="Hard-deletes the market and all related rows (reserves, outcomes, holdings, tx). Requires admin password."
 )
-def admin_reset(
+def admin_delete_market(
     market_id: int,
-    req: AdminResetRequest = Body(...),
+    req: AdminDeleteMarketRequest = Body(...),
     db: Session = Depends(get_db),
 ):
     _assert_admin(req.password)
-    
 
-    now_iso = _now_iso()
-    now = datetime.utcnow().replace(microsecond=0)
-    target = datetime(now.year, 9, 15, 0, 0, 0)
-    if now >= target:
-        end_iso = (datetime.utcnow() + timedelta(days=MARKET_DURATION_DAYS)).replace(microsecond=0).isoformat()
-    else:
-        end_iso = target.replace(microsecond=0).isoformat()
-
-    # Upsert + mark ACTIVE
     m = db.get(Market, market_id)
     if not m:
-        m = Market(
-            id=market_id,
-            start_ts=now_iso,
-            end_ts=end_iso,
-            winner_token=None,
-            resolved=0,          # <-- active
-            resolved_ts=None
-        )
-        db.add(m)
-    else:
-        m.start_ts = now_iso
-        m.end_ts = end_iso
-        m.winner_token = None
-        m.resolved = 0          # <-- active
-        m.resolved_ts = None
+        raise HTTPException(status_code=404, detail="Market not found")
 
-    # Reset ONLY this market's reserves (avoid UNIQUE constraint)
-    db.query(Reserve).filter(Reserve.market_id == market_id).delete(synchronize_session=False)
-    # Fresh zeroed rows
-    for t in TOKENS:
-        db.add(Reserve(market_id=market_id, token=t, shares=0, usdc=0.0))
+    # Delete children first (if you don't have ON DELETE CASCADE)
+    tx_del        = db.execute(delete(Tx).where(Tx.market_id == market_id)).rowcount
+    hold_del      = db.execute(delete(Holding).where(Holding.market_id == market_id)).rowcount
+    res_del       = db.execute(delete(Reserve).where(Reserve.market_id == market_id)).rowcount
 
-    if req.wipe_users:
-        db.query(Holding).delete(synchronize_session=False)
-        db.query(Tx).delete(synchronize_session=False)
-        db.query(User).delete(synchronize_session=False)
-    else:
-        # keep users; reset balances/holdings; clear tx
-        for u in db.query(User).all():
-            u.balance = STARTING_BALANCE
-        db.query(Holding).update({Holding.shares: 0})
-        db.query(Tx).delete(synchronize_session=False)
+    # If you have a MarketOutcome table, include it:
+    try:
+        mo_del = db.execute(delete(MarketOutcome).where(MarketOutcome.market_id == market_id)).rowcount
+    except NameError:
+        mo_del = 0  # table not present
 
+    # Finally delete the market
+    db.delete(m)
     db.commit()
-    return {"status": "ok", "market_active": True, "start_ts": m.start_ts, "end_ts": m.end_ts}
+
+    return {
+        "status": "ok",
+        "deleted": {
+            "market_id": market_id,
+            "tx": tx_del,
+            "holdings": hold_del,
+            "reserves": res_del,
+            "outcomes": mo_del,
+            "markets": 1
+        }
+    }
+
+# # Admin market reset (makes market active)
+# @app.post(
+#     "/admin/{market_id}/reset",
+#     tags=["Admin"],
+#     summary="Reset one market/users",
+#     description="Resets a market (and optionally users). Requires admin password in body."
+# )
+# def admin_reset(
+#     market_id: int,
+#     req: AdminResetRequest = Body(...),
+#     db: Session = Depends(get_db),
+# ):
+#     _assert_admin(req.password)
+    
+
+#     now_iso = _now_iso()
+#     now = datetime.utcnow().replace(microsecond=0)
+#     target = datetime(now.year, 9, 15, 0, 0, 0)
+#     if now >= target:
+#         end_iso = (datetime.utcnow() + timedelta(days=MARKET_DURATION_DAYS)).replace(microsecond=0).isoformat()
+#     else:
+#         end_iso = target.replace(microsecond=0).isoformat()
+
+#     # Upsert + mark ACTIVE
+#     m = db.get(Market, market_id)
+#     if not m:
+#         m = Market(
+#             id=market_id,
+#             start_ts=now_iso,
+#             end_ts=end_iso,
+#             winner_token=None,
+#             resolved=0,          # <-- active
+#             resolved_ts=None
+#         )
+#         db.add(m)
+#     else:
+#         m.start_ts = now_iso
+#         m.end_ts = end_iso
+#         m.winner_token = None
+#         m.resolved = 0          # <-- active
+#         m.resolved_ts = None
+
+#     # Reset ONLY this market's reserves (avoid UNIQUE constraint)
+#     db.query(Reserve).filter(Reserve.market_id == market_id).delete(synchronize_session=False)
+#     # Fresh zeroed rows
+#     for t in TOKENS:
+#         db.add(Reserve(market_id=market_id, token=t, shares=0, usdc=0.0))
+
+#     if req.wipe_users:
+#         db.query(Holding).delete(synchronize_session=False)
+#         db.query(Tx).delete(synchronize_session=False)
+#         db.query(User).delete(synchronize_session=False)
+#     else:
+#         # keep users; reset balances/holdings; clear tx
+#         for u in db.query(User).all():
+#             u.balance = STARTING_BALANCE
+#         db.query(Holding).update({Holding.shares: 0})
+#         db.query(Tx).delete(synchronize_session=False)
+
+#     db.commit()
+#     return {"status": "ok", "market_active": True, "start_ts": m.start_ts, "end_ts": m.end_ts}
 
 # Resolve market
 @app.post(

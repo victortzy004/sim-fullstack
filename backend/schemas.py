@@ -78,6 +78,9 @@ class AdminConfigureMarketRequest(BaseModel):
     outcomes: list[str] | None = None  # canonical outcomes list (order matters)
     end_ts: Optional[str] = None 
 
+class AdminDeleteMarketRequest(BaseModel):
+    password: str
+
 class ReserveOut(BaseModel):
     market_id: int
     token: str
