@@ -123,15 +123,27 @@ def _shares_at_ts(
     prev_post_trade_qty = 0
     for r in rows:
         print(f"  ↳ tx id={r.id} act={r.action} qty={r.qty} qty_change={r.qty_change}", flush=True)
-        if getattr(r, "qty_change", None) is not None:
-            delta = int(r.qty_change or 0)
+
+        qc = getattr(r, "qty_change", None)
+
+        # use qty_change only if it’s not None *and* non-zero
+        if qc not in (None, 0):
+            delta = int(qc)
             total += delta
             prev_post_trade_qty += delta
         else:
-            post = int(r.qty or 0)
-            delta = post - prev_post_trade_qty
+            # fallback logic based on action
+            act = (r.action or "").strip().lower()
+            qn = int(r.qty or 0)
+            if act == "buy":
+                delta = abs(qn)
+            elif act == "sell":
+                delta = -abs(qn)
+            else:
+                delta = 0
+
             total += delta
-            prev_post_trade_qty = post
+            prev_post_trade_qty += delta
 
     print(f"[shares_at_ts] total shares_at={total} for {token}", flush=True)
     return max(0, int(total))
@@ -188,7 +200,7 @@ def build_resolved_holdings_for_user(
             )
             print(f"[resolved_holdings] market={mid} token={tok} shares_at={shares_at}", flush=True)
 
-            if shares_at < 0: # bug
+            if shares_at <= 0: # bug
                 continue
             sell_delta = winner_sell_delta if tok.upper() == winner_upper else 0.0
             out.append(
