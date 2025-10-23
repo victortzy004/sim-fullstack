@@ -188,7 +188,7 @@ def build_resolved_holdings_for_user(
             )
             print(f"[resolved_holdings] market={mid} token={tok} shares_at={shares_at}", flush=True)
 
-            if shares_at <= 0:
+            if shares_at < 0: # bug
                 continue
             sell_delta = winner_sell_delta if tok.upper() == winner_upper else 0.0
             out.append(
