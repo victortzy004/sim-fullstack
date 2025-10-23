@@ -1,5 +1,6 @@
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Optional, List, Literal, Dict
+from datetime import datetime
 
 class HealthOut(BaseModel):
     status: Literal["ok"]
@@ -17,6 +18,21 @@ class HoldingOut(BaseModel):
     value: float = 0.0
     model_config = ConfigDict(from_attributes=True)
 
+class ResolvedHoldingOut(BaseModel):
+    """
+    Holding that was 'held to resolution' and settled.
+    - shares: winner shares the user still held at the instant of resolution
+    - sell_delta: the USDC payout credited at resolution
+    - resolved_ts: when the resolution occurred (server timestamp)
+    """
+    user_id: int
+    market_id: int
+    token: str
+    shares: int
+    sell_delta: float
+    resolved_ts: Optional[datetime] = None
+    model_config = ConfigDict(from_attributes=True)
+
 
 class UserCreate(BaseModel):
     username: str
@@ -27,15 +43,24 @@ class UserSummaryOut(BaseModel):
     balance: float
     model_config = ConfigDict(from_attributes=True)
     
+# class UserOut(BaseModel):
+#     id: int
+#     username: str
+#     balance: float
+#     holdings: List[HoldingOut] = []          # NEW: embed full rows
+#     # (optional convenience: map of token->shares)
+#     holdings_by_token: Dict[str, int] = {}   # NEW: handy for UIs
+#     model_config = ConfigDict(from_attributes=True)
+
 class UserOut(BaseModel):
     id: int
     username: str
     balance: float
-    holdings: List[HoldingOut] = []          # NEW: embed full rows
-    # (optional convenience: map of token->shares)
-    holdings_by_token: Dict[str, int] = {}   # NEW: handy for UIs
+    holdings: List[HoldingOut] = []                 # live holdings
+    holdings_by_token: Dict[str, int] = {}          # convenience map for UIs
+    resolved_holdings: List[ResolvedHoldingOut] = []  # NEW: holdings settled at resolution
     model_config = ConfigDict(from_attributes=True)
-
+    
 class UserWithPointsOut(UserOut):
     volume_points: float
     pnl_points: float
@@ -122,6 +147,7 @@ class TxOut(BaseModel):
     action: str
     token: str
     qty: int
+    qty_change: int
     buy_price: Optional[float]
     sell_price: Optional[float]
     buy_delta: Optional[float]

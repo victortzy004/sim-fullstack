@@ -1,8 +1,10 @@
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Tuple
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func
+from .schemas import HoldingOut, ResolvedHoldingOut, UserOut
 from .models import User, Market, Reserve, Holding, Tx, MarketOutcome
 
 
@@ -355,7 +357,7 @@ def do_trade(db: Session, user_id: int, token: str, market_id: int, side: str, m
         # tx log (store canonical token)
         db.add(Tx(
             ts=now_iso, user_id=user_id, market_id=market_id, user_name=username,
-            action="Buy", token=tok_canon, qty=qty,
+            action="Buy", token=tok_canon, qty=hold.shares, qty_change=qty,
             buy_price=float(buy_price), buy_delta=float(buy_amt_delta),
             sell_price=None, sell_delta=None,
             balance_after=float(user.balance),
@@ -381,7 +383,7 @@ def do_trade(db: Session, user_id: int, token: str, market_id: int, side: str, m
         # tx log (store canonical token)
         db.add(Tx(
             ts=now_iso, user_id=user_id, market_id=market_id, user_name=username,
-            action="Sell", token=tok_canon, qty=qty,
+            action="Sell", token=tok_canon, qty=hold.shares,qty_change=-qty,
             buy_price=None, buy_delta=None,
             sell_price=float(sell_price), sell_delta=float(sell_amt_delta),
             balance_after=float(user.balance),
@@ -687,4 +689,217 @@ def compute_user_points(db: Session, market_id: Optional[int] = None):
 
 
 
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+def _iso(ts: datetime | str) -> str:
+    """Return ISO-8601 string (keeps strings as-is; converts datetimes)."""
+    if isinstance(ts, str):
+        return ts
+    return ts.replace(microsecond=0).isoformat()
+
+#     return out
+def _winner_shares_at_resolution(
+    db: Session,
+    *,
+    user_id: int,
+    market_id: int,
+    winner_token: str,
+    resolved_ts: datetime | str,
+) -> int:
+    """
+    Reconstruct user's outstanding shares in `winner_token` at/before resolution.
+    Priority:
+      1) Sum qty_change (directional deltas) for Buy/Sell.
+      2) Fallback: derive delta from consecutive rows' `qty` (which is post-trade total).
+    Only trading actions affect live shares.
+    """
+    resolved_iso = _iso(resolved_ts)
+    token_upper = (winner_token or "").strip().upper()
+
+    q = (
+        db.query(Tx)
+          .filter(
+              Tx.user_id == user_id,
+              Tx.market_id == market_id,
+              func.upper(Tx.token) == token_upper,           # <-- case-insensitive
+              Tx.ts <= resolved_iso,
+              Tx.action.in_(["Buy", "Sell"]),
+          )
+          .order_by(Tx.ts.asc(), Tx.id.asc())
+    )
+
+    total = 0
+    prev_qty_seen = 0  # holds the last *post-trade* qty if qty_change is missing
+
+    for r in q.all():
+        # Preferred: directional delta
+        if hasattr(Tx, "qty_change") and (r.qty_change is not None):
+            delta = int(r.qty_change or 0)
+            total += delta
+            prev_qty_seen += delta  # keep prev in sync for any mixed-history gaps
+            continue
+
+        # Fallback: derive delta from r.qty which is a post-trade total
+        curr_total_qty = int(r.qty or 0)
+        delta = curr_total_qty - prev_qty_seen
+        total += delta
+        prev_qty_seen = curr_total_qty
+
+    return max(0, total)
+
+
+def build_resolved_holdings_for_user(
+    db: Session,
+    *,
+    user_id: int,
+    market_id: Optional[int] = None,
+) -> List[ResolvedHoldingOut]:
+    """
+    Build resolved_holdings for a user.
+    For each Resolve tx:
+      - token: Resolve.token (fallback Market.winner_token)
+      - shares: prefer Resolve.qty_change; else Resolve.qty; else reconstruct via trades
+      - sell_delta: Resolve.sell_delta (0.0 if null)
+      - resolved_ts: Market.resolved_ts (fallback Resolve.ts)
+    """
+    txq = db.query(Tx).filter(Tx.user_id == user_id, Tx.action == "Resolve")
+    if market_id is not None:
+        txq = txq.filter(Tx.market_id == market_id)
+    txq = txq.order_by(Tx.ts.asc(), Tx.id.asc())
+    rows = txq.all()
+    if not rows:
+        return []
+
+    # Prefetch market meta
+    m_ids = {int(r.market_id) for r in rows if r.market_id is not None}
+    markets: Dict[int, Market] = {}
+    if m_ids:
+        mkts = db.query(Market).filter(Market.id.in_(m_ids)).all()
+        markets = {m.id: m for m in mkts}
+        print(markets)
+    out: List[ResolvedHoldingOut] = []
+    for r in rows:
+        mid = int(r.market_id)
+        m = markets.get(mid)
+        print(m)
+        # Resolve uses the winning token; keep its original case if possible
+        winner_tok = (r.token or (m.winner_token if m else None)) or ""
+        if not winner_tok:
+            continue
+
+        resolved_ts = (m.resolved_ts if (m and m.resolved_ts) else r.ts)
+
+        # Prefer qty_change (your proposed admin_resolve will set this),
+        # otherwise use qty; otherwise reconstruct from trades.
+        if hasattr(Tx, "qty_change") and (r.qty_change is not None):
+            shares_at_resolve = int(r.qty_change or 0)
+        elif r.qty is not None and int(r.qty) > 0:
+            shares_at_resolve = int(r.qty)
+        else:
+            shares_at_resolve = _winner_shares_at_resolution(
+                db=db,
+                user_id=user_id,
+                market_id=mid,
+                winner_token=winner_tok,
+                resolved_ts=resolved_ts,
+            )
+
+        out.append(
+            ResolvedHoldingOut(
+                user_id=user_id,
+                market_id=mid,
+                token=winner_tok,
+                shares=max(0, int(shares_at_resolve)),
+                sell_delta=float(r.sell_delta or 0.0),
+                resolved_ts=resolved_ts,
+            )
+        )
+
+    return out
+
+# ---------------------------------------------------------------------
+# Main builder used by GET /users/{id} and /users/by-username/{username}
+# ---------------------------------------------------------------------
+
+def user_out_by_filter(
+    db: Session,
+    *,
+    user_id: int | None = None,
+    username: str | None = None,
+    market_id: int | None = None,
+) -> UserOut:
+    """
+    Returns UserOut with:
+      - live holdings (priced at current buy-curve)
+      - holdings_by_token map
+      - resolved_holdings (per Resolve txs)
+    """
+    # Find user (exactly one of user_id or username must be provided)
+    if (user_id is None) == (username is None):
+        raise HTTPException(status_code=400, detail="Provide exactly one of user_id or username")
+
+    if user_id is not None:
+        user = db.get(User, user_id)
+    else:
+        user = (
+            db.query(User)
+            .filter(func.lower(User.username) == func.lower(username.strip()))
+            .first()
+        )
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # --- Live holdings (optionally filtered by market) ---
+    q = db.query(Holding).filter(Holding.user_id == user.id)
+    if market_id is not None:
+        q = q.filter(Holding.market_id == market_id)
+    holdings_rows = q.order_by(Holding.token.asc()).all()
+
+    # Prefetch reserves for (market_id, token) to price holdings now (buy curve)
+    m_ids = {h.market_id for h in holdings_rows if h.market_id is not None}
+    toks = {h.token for h in holdings_rows}
+    res_map: Dict[Tuple[int, str], int] = {}
+    if m_ids and toks:
+        reserves = (
+            db.query(Reserve)
+            .filter(Reserve.market_id.in_(m_ids), Reserve.token.in_(toks))
+            .all()
+        )
+        res_map = {(r.market_id, r.token): int(r.shares or 0) for r in reserves}
+
+    out_holdings: List[HoldingOut] = []
+    for h in holdings_rows:
+        key = (h.market_id, h.token) if h.market_id is not None else None
+        reserve_shares = res_map.get(key, 0) if key else 0
+        price_now = float(buy_curve(reserve_shares))
+        out_holdings.append(
+            HoldingOut(
+                user_id=h.user_id,
+                market_id=h.market_id,
+                token=h.token,
+                shares=int(h.shares or 0),
+                price=price_now,
+                value=price_now * int(h.shares or 0),
+            )
+        )
+
+    # --- Resolved holdings (held-to-resolution) ---
+    resolved_holdings = build_resolved_holdings_for_user(
+        db=db,
+        user_id=user.id,
+        market_id=market_id,
+    )
+
+    return UserOut(
+        id=user.id,
+        username=user.username,
+        balance=user.balance,
+        holdings=out_holdings,
+        holdings_by_token={h.token: int(h.shares or 0) for h in holdings_rows},
+        resolved_holdings=resolved_holdings,
+    )
 

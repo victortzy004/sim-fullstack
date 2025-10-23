@@ -105,6 +105,7 @@ class Tx(Base):
     action = Column(String, nullable=False)
     token = Column(String, nullable=False)
     qty = Column(Integer, nullable=False)
+    qty_change = Column(Integer, nullable=True, comment="Positive for buys, negative for sells or resolve")
     buy_price = Column(Float, nullable=True)
     sell_price = Column(Float, nullable=True)
     buy_delta = Column(Float, nullable=True)
@@ -114,3 +115,5 @@ class Tx(Base):
     __table_args__ = (
         Index("ix_tx_market_ts", "market_id", "ts"),
     )
+
+    

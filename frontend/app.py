@@ -19,7 +19,8 @@ from dotenv import load_dotenv
 
 # ROOT = Path(__file__).resolve().parents[1]
 # load_dotenv(ROOT / ".env")   # make variables visible to os.getenv
-BASE = "http://concept.alkimiya.io/simpi"
+# BASE = "http://concept.alkimiya.io/simpi"
+BASE = "http://concept.alkimiya.io/api"
 # BASE = "http://localhost:8000/"
 
 
