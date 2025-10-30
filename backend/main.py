@@ -51,49 +51,6 @@ def _iso(ts: datetime | str) -> str:
         return ts
     return ts.replace(microsecond=0).isoformat()
 # ---------- helpers: generic share-reconstruction at a timestamp ----------
-# def _shares_at_ts(
-#     db: Session,
-#     *,
-#     user_id: int,
-#     market_id: int,
-#     token: str,
-#     ts_iso: str,
-# ) -> int:
-#     """
-#     Reconstruct user's outstanding shares in `token` at/before ts_iso.
-#     Priority:
-#       1) Sum Tx.qty_change for Buy/Sell when present.
-#       2) Fallback: derive deltas from consecutive Tx.qty (post-trade total).
-#     """
-#     token_upper = (token or "").strip().upper()
-#     q = (
-#         db.query(Tx)
-#           .filter(
-#               Tx.user_id == user_id,
-#               Tx.market_id == market_id,
-#               func.upper(Tx.token) == token_upper,
-#               Tx.ts <= ts_iso,
-#               Tx.action.in_(["Buy", "Sell"]),
-#           )
-#           .order_by(Tx.ts.asc(), Tx.id.asc())
-#     )
-
-#     total = 0
-#     prev_qty_seen = 0  # for fallback path
-
-#     for r in q.all():
-#         # Prefer directional qty_change if column exists and value is not NULL
-#         if hasattr(Tx, "qty_change") and (r.qty_change is not None):
-#             total += int(r.qty_change or 0)
-#             prev_qty_seen = total  # keep in sync if mixed history
-#         else:
-#             # Fallback on 'qty' as post-trade total and compute deltas
-#             curr_total_qty = int(r.qty or 0)
-#             delta = curr_total_qty - prev_qty_seen
-#             total += delta
-#             prev_qty_seen = curr_total_qty
-
-#     return max(0, total)
 def _shares_at_ts(
     db: Session,
     *,
@@ -216,223 +173,7 @@ def build_resolved_holdings_for_user(
 
     print(f"[resolved_holdings] total rows={len(out)}", flush=True)
     return out
-# def build_resolved_holdings_for_user(
-#     db: Session,
-#     *,
-#     user_id: int,
-#     market_id: Optional[int] = None,
-# ) -> List[ResolvedHoldingOut]:
-#     """
-#     For each RESOLVED market:
-#       - Include an entry for EVERY token the user held (>0) at the resolution instant.
-#       - Winner gets sell_delta from the user's Resolve tx (if present), non-winners get 0.0.
-#       - shares is the user’s outstanding shares at resolved_ts.
-#     """
-#     # 1) Find resolved markets (optionally scoped)
-#     mq = db.query(Market).filter(Market.resolved == 1)
-#     if market_id is not None:
-#         mq = mq.filter(Market.id == market_id)
-#     markets = mq.all()
-#     if not markets:
-#         return []
 
-#     out: List[ResolvedHoldingOut] = []
-
-#     for m in markets:
-#         mid = int(m.id)
-#         resolved_ts = (m.resolved_ts or m.end_ts or m.start_ts)
-#         if not resolved_ts:
-#             # Shouldn't happen, but guard anyway
-#             continue
-#         resolved_iso = _iso(resolved_ts)
-
-#         # 2) Outcome universe for this market (exact, canonical casing)
-#         tokens = [
-#             o.token
-#             for o in db.query(MarketOutcome)
-#                        .filter(MarketOutcome.market_id == mid)
-#                        .order_by(MarketOutcome.sort_order.asc(), MarketOutcome.token.asc())
-#                        .all()
-#         ]
-
-#         # 3) Winner token for this market
-#         winner_tok = (m.winner_token or "").strip()
-#         winner_upper = winner_tok.upper()
-
-#         # 4) Resolve tx for THIS user & market (to get sell_delta for the winner, if any)
-#         resolve_tx = (
-#             db.query(Tx)
-#               .filter(
-#                   Tx.user_id == user_id,
-#                   Tx.market_id == mid,
-#                   Tx.action == "Resolve",
-#               )
-#               .order_by(Tx.ts.desc(), Tx.id.desc())
-#               .first()
-#         )
-#         winner_sell_delta = 0.0
-#         if resolve_tx and (resolve_tx.token or "").upper() == winner_upper:
-#             winner_sell_delta = float(resolve_tx.sell_delta or 0.0)
-
-#         # 5) For each token, compute shares-at-resolution; include if >0
-#         for tok in tokens:
-#             shares_at = _shares_at_ts(
-#                 db=db,
-#                 user_id=user_id,
-#                 market_id=mid,
-#                 token=tok,
-#                 ts_iso=resolved_iso,
-#             )
-#             if shares_at <= 0:
-#                 continue  # only include tokens the user actually held at resolution
-
-#             sell_delta = winner_sell_delta if tok.upper() == winner_upper else 0.0
-
-#             out.append(
-#                 ResolvedHoldingOut(
-#                     user_id=user_id,
-#                     market_id=mid,
-#                     token=tok,
-#                     shares=int(shares_at),
-#                     sell_delta=sell_delta,
-#                     resolved_ts=resolved_iso,
-#                 )
-#             )
-
-#     return out
-
-# check
-
-# def _winner_shares_at_resolution(
-#     db: Session,
-#     *,
-#     user_id: int,
-#     market_id: int,
-#     winner_token: str,
-#     resolved_ts: datetime | str,
-# ) -> int:
-#     """
-#     Reconstruct user's outstanding shares in `winner_token` at/before resolution.
-#     Priority:
-#       1) Sum qty_change (directional deltas) for Buy/Sell.
-#       2) Fallback: derive delta from consecutive rows' `qty` (which is post-trade total).
-#     Only trading actions affect live shares.
-#     """
-#     resolved_iso = _iso(resolved_ts)
-#     token_upper = (winner_token or "").strip().upper()
-
-#     q = (
-#         db.query(Tx)
-#           .filter(
-#               Tx.user_id == user_id,
-#               Tx.market_id == market_id,
-#               func.upper(Tx.token) == token_upper,   # case-insensitive
-#               Tx.ts <= resolved_iso,
-#               Tx.action.in_(["Buy", "Sell"]),
-#           )
-#           .order_by(Tx.ts.asc(), Tx.id.asc())
-#     )
-
-#     total = 0
-#     prev_qty_seen = 0
-
-#     rows = q.all()
-#     print(f"[resolved/reconstruct] user={user_id} market={market_id} token={winner_token} up-to={resolved_iso} rows={len(rows)}", flush=True)
-
-#     for r in rows:
-#         if hasattr(Tx, "qty_change") and (r.qty_change is not None):
-#             delta = int(r.qty_change or 0)
-#             total += delta
-#             prev_qty_seen += delta
-#             print(f"  - {r.ts} {r.action} qty_change={r.qty_change} -> total={total}", flush=True)
-#         else:
-#             curr_total_qty = int(r.qty or 0)
-#             delta = curr_total_qty - prev_qty_seen
-#             total += delta
-#             prev_qty_seen = curr_total_qty
-#             print(f"  - {r.ts} {r.action} qty(post)={r.qty} delta={delta} -> total={total}", flush=True)
-
-#     total = max(0, total)
-#     print(f"[resolved/reconstruct] result shares={total}", flush=True)
-#     return total
-
-
-# def build_resolved_holdings_for_user(
-#     db: Session,
-#     *,
-#     user_id: int,
-#     market_id: Optional[int] = None,
-# ) -> List[ResolvedHoldingOut]:
-#     """
-#     Build resolved_holdings for a user.
-#     For each Resolve tx:
-#       - token: Resolve.token (fallback Market.winner_token)
-#       - shares: prefer Resolve.qty_change; else Resolve.qty; else reconstruct via trades
-#       - sell_delta: Resolve.sell_delta (0.0 if null)
-#       - resolved_ts: Market.resolved_ts (fallback Resolve.ts)
-#     """
-#     txq = db.query(Tx).filter(Tx.user_id == user_id, Tx.action == "Resolve")
-#     if market_id is not None:
-#         txq = txq.filter(Tx.market_id == market_id)
-#     txq = txq.order_by(Tx.ts.asc(), Tx.id.asc())
-
-#     rows = txq.all()
-#     print(f"[resolved/build] user={user_id} market_filter={market_id} resolve_rows={len(rows)}", flush=True)
-#     if not rows:
-#         return []
-
-#     # Prefetch Markets (for resolved_ts / winner_token)
-#     m_ids = {int(r.market_id) for r in rows if r.market_id is not None}
-#     markets: Dict[int, Market] = {}
-#     if m_ids:
-#         mkts = db.query(Market).filter(Market.id.in_(m_ids)).all()
-#         markets = {m.id: m for m in mkts}
-#     print(f"[resolved/build] markets={list(markets.keys())}", flush=True)
-
-#     out: List[ResolvedHoldingOut] = []
-#     for r in rows:
-#         mid = int(r.market_id)
-#         m = markets.get(mid)
-#         winner_tok = (r.token or (m.winner_token if m else None)) or ""
-#         resolved_ts = (m.resolved_ts if (m and m.resolved_ts) else r.ts)
-#         print(f"  -> resolve row id={r.id} mid={mid} tok='{winner_tok}' ts={resolved_ts} sell_delta={r.sell_delta}", flush=True)
-
-#         if not winner_tok:
-#             print("     (skip: empty winner token)", flush=True)
-#             continue
-
-#         # Prefer qty_change, then qty, else reconstruct
-#         if hasattr(Tx, "qty_change") and (r.qty_change is not None):
-#             shares_at_resolve = int(r.qty_change or 0)
-#             src = "qty_change"
-#         elif r.qty is not None and int(r.qty) > 0:
-#             shares_at_resolve = int(r.qty)
-#             src = "qty"
-#         else:
-#             shares_at_resolve = _winner_shares_at_resolution(
-#                 db=db,
-#                 user_id=user_id,
-#                 market_id=mid,
-#                 winner_token=winner_tok,
-#                 resolved_ts=resolved_ts,
-#             )
-#             src = "reconstructed"
-
-#         print(f"     shares_at_resolve={shares_at_resolve} (src={src})", flush=True)
-
-#         out.append(
-#             ResolvedHoldingOut(
-#                 user_id=user_id,
-#                 market_id=mid,
-#                 token=winner_tok,
-#                 shares=max(0, int(shares_at_resolve)),
-#                 sell_delta=float(r.sell_delta or 0.0),
-#                 resolved_ts=resolved_ts,
-#             )
-#         )
-
-#     print(f"[resolved/build] built {len(out)} rows", flush=True)
-#     return out
 
 def _user_out_by_filter(
     db: Session,
@@ -748,7 +489,8 @@ def join_or_load_user(payload: UserCreate, db: Session = Depends(get_db)):
     user = db.query(User).filter(func.lower(User.username) == func.lower(uname)).first()
     if user:
         # return existing (200 would also be fine; we still return 201 here)
-        return UserOut(id=user.id, username=user.username, balance=user.balance)
+        return _user_out_by_filter(db, user_id=user.id, market_id=None)
+        # return UserOut(id=user.id, username=user.username, balance=user.balance)
 
     # create new
     balance = SPECIAL_STARTING_BALANCE if uname == 'jack' else STARTING_BALANCE
@@ -758,7 +500,7 @@ def join_or_load_user(payload: UserCreate, db: Session = Depends(get_db)):
 
     db.commit()
     db.refresh(user)
-    return UserOut(id=user.id, username=user.username, balance=user.balance)
+    return _user_out_by_filter(db, user_id=user.id, market_id=None)
 
 
 # ====== Admin ======
