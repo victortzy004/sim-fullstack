@@ -562,15 +562,73 @@ st.divider()
 # Transaction Log
 # ================================
 st.subheader("Transaction Log")
+
+# Choose the source df like you already do
 tx_display = tx_norm_all.copy() if tx_scope == "All markets" else tx_norm_selected.copy()
+
 if tx_display.empty:
     st.info("No transactions to display.")
 else:
-    float_cols = tx_display.select_dtypes(include=["float64", "float32", "float"]).columns
+    # ---- Detect username column gracefully ----
+    USER_COL_CANDIDATES = ["user_name", "User", "Username", "user"]
+    user_col = next((c for c in USER_COL_CANDIDATES if c in tx_display.columns), None)
+
+    # ---- Build filter UI ----
+    c1, c2, c3 = st.columns([1, 1, 1.2])
+
+    with c1:
+        # Actions present in the data
+        action_values = []
+        if "Action" in tx_display.columns:
+            action_values = sorted([a for a in tx_display["Action"].dropna().unique().tolist() if a])
+        selected_actions = st.multiselect(
+            "Filter: Action",
+            options=action_values,
+            default=action_values,  # default to all
+            placeholder="Select actions"
+        )
+
+    with c2:
+        # Exact-match user filter (multiselect)
+        user_values = []
+        if user_col:
+            user_values = sorted([u for u in tx_display[user_col].dropna().astype(str).unique().tolist() if u])
+        selected_users = st.multiselect(
+            "Filter: User",
+            options=user_values,
+            default=user_values,  # default to all
+            placeholder="Select users"
+        )
+
+    with c3:
+        # Optional partial-match username search (case-insensitive)
+        user_search = st.text_input(
+            "Search user (contains)",
+            value="",
+            placeholder="type part of a username…"
+        ).strip()
+
+    # ---- Apply filters ----
+    df = tx_display
+
+    if "Action" in df.columns and selected_actions:
+        df = df[df["Action"].isin(selected_actions)]
+
+    if user_col and selected_users:
+        df = df[df[user_col].isin(selected_users)]
+
+    if user_col and user_search:
+        df = df[df[user_col].astype(str).str.contains(user_search, case=False, na=False)]
+
+    # ---- Format floats after filtering ----
+    float_cols = df.select_dtypes(include=["float64", "float32", "float"]).columns
     for col in float_cols:
-        tx_display[col] = tx_display[col].map(lambda x: f"{x:.4f}" if pd.notnull(x) else "-")
-    st.dataframe(tx_display)
+        df[col] = df[col].map(lambda x: f"{x:.4f}" if pd.notnull(x) else "-")
+
+    st.dataframe(df, use_container_width=True)
+
 st.divider()
+
 
 # ================================
 # Payout/Share Trend (selected)
