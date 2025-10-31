@@ -1071,13 +1071,18 @@ def get_holdings_by_username(
     summary="List transaction logs (filter, latest-N, pagination)",
     description=(
         "Returns transaction logs ordered by timestamp. "
-        "Use `market_id` to filter; `limit` to fetch the latest N; "
+        "Use `market_id` to filter; `action` for Buy/Sell/Resolve; "
+        "`username` or `user_id` for a specific user; "
+        "`limit` to fetch the latest N; "
         "`page` + `page_size` for pagination; and `sort` to choose ordering."
     ),
 )
 def get_tx(
     response: Response,
     market_id: Annotated[int | None, Query(ge=1, description="Filter by market id")] = None,
+    action: Annotated[Literal["Buy", "Sell", "Resolve"] | None, Query(description="Filter by action")] = None,
+    username: Annotated[str | None, Query(description="Filter by username (case-insensitive)")] = None,
+    user_id: Annotated[int | None, Query(ge=1, description="Filter by user id")] = None,
     # Choose ordering; default asc to keep backward-compat with your existing behavior
     sort: Annotated[Literal["asc", "desc"], Query(description="Sort by timestamp")] = "asc",
     # Quick 'latest N' (ignores pagination if set). Bound to reasonable max.
@@ -1088,22 +1093,32 @@ def get_tx(
     db: Session = Depends(get_db),
 ):
     q = db.query(Tx)
+
+    # ---- Filters ----
     if market_id is not None:
         q = q.filter(Tx.market_id == market_id)
 
-    # Apply ordering first
+    if action is not None:
+        q = q.filter(Tx.action == action)
+
+    if user_id is not None:
+        q = q.filter(Tx.user_id == user_id)
+
+    if username is not None and username.strip():
+        # Case-insensitive match on Tx.user_name
+        q = q.filter(func.lower(Tx.user_name) == func.lower(username.strip()))
+
+    # ---- Ordering ----
     order_col = Tx.ts.desc() if sort == "desc" else Tx.ts.asc()
     q = q.order_by(order_col)
 
     # ---- Latest N (takes precedence over pagination)
     if limit is not None:
         rows = q.limit(limit).all()
-        # For latest-N we expose count of returned rows (not total) to avoid an extra COUNT(*)
         response.headers["X-Total-Count"] = str(len(rows))
         return rows
 
     # ---- Pagination
-    # If either `page` or `page_size` is provided, default the other sensibly
     if page is not None or page_size is not None:
         page = page or 1
         page_size = page_size or 50
@@ -1118,6 +1133,60 @@ def get_tx(
 
     # ---- Default (no limit, no pagination)
     return q.all()
+# @app.get(
+#     "/tx",
+#     response_model=List[TxOut],
+#     tags=["Transactions"],
+#     summary="List transaction logs (filter, latest-N, pagination)",
+#     description=(
+#         "Returns transaction logs ordered by timestamp. "
+#         "Use `market_id` to filter; `limit` to fetch the latest N; "
+#         "`page` + `page_size` for pagination; and `sort` to choose ordering."
+#     ),
+# )
+# def get_tx(
+#     response: Response,
+#     market_id: Annotated[int | None, Query(ge=1, description="Filter by market id")] = None,
+#     # Choose ordering; default asc to keep backward-compat with your existing behavior
+#     sort: Annotated[Literal["asc", "desc"], Query(description="Sort by timestamp")] = "asc",
+#     # Quick 'latest N' (ignores pagination if set). Bound to reasonable max.
+#     limit: Annotated[int | None, Query(ge=1, le=1000, description="Return only the latest N entries (ignores pagination)")] = None,
+#     # Pagination (1-based page index)
+#     page: Annotated[int | None, Query(ge=1, description="1-based page index")] = None,
+#     page_size: Annotated[int | None, Query(ge=1, le=1000, description="Items per page")] = None,
+#     db: Session = Depends(get_db),
+# ):
+#     q = db.query(Tx)
+#     if market_id is not None:
+#         q = q.filter(Tx.market_id == market_id)
+
+#     # Apply ordering first
+#     order_col = Tx.ts.desc() if sort == "desc" else Tx.ts.asc()
+#     q = q.order_by(order_col)
+
+#     # ---- Latest N (takes precedence over pagination)
+#     if limit is not None:
+#         rows = q.limit(limit).all()
+#         # For latest-N we expose count of returned rows (not total) to avoid an extra COUNT(*)
+#         response.headers["X-Total-Count"] = str(len(rows))
+#         return rows
+
+#     # ---- Pagination
+#     # If either `page` or `page_size` is provided, default the other sensibly
+#     if page is not None or page_size is not None:
+#         page = page or 1
+#         page_size = page_size or 50
+
+#         total = q.count()
+#         rows = q.offset((page - 1) * page_size).limit(page_size).all()
+
+#         response.headers["X-Total-Count"] = str(total)
+#         response.headers["X-Page"] = str(page)
+#         response.headers["X-Page-Size"] = str(page_size)
+#         return rows
+
+#     # ---- Default (no limit, no pagination)
+#     return q.all()
 
 # ====== Trading ======
 # Post a trade action for a user

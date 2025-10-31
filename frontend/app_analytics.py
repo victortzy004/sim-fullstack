@@ -21,7 +21,7 @@ st.caption(f"API_BASE_URL: {BASE}")
 # ================================
 DEFAULT_DECIMAL_PRECISION = 2
 MAX_SHARES = 5_000_000
-STARTING_BALANCE = 10_000.0
+STARTING_BALANCE = 50_000.0
 BINARY_OUTCOME_TOKENS = ["YES", "NO"]
 MARKET_ID_DEFAULT = 1
 
@@ -62,13 +62,16 @@ st.title("42: Dynamic Pari-mutuel — Cross-Market Analytics")
 # ================================
 # Utilities
 # ================================
+# def _extract_tokens(market: dict) -> list[str]:
+#     outs = market.get("outcomes") or []
+#     if outs and isinstance(outs[0], dict):
+#         toks = [(o.get("token") or o.get("display") or o.get("name") or "").strip() for o in outs]
+#     else:
+#         toks = [str(o).strip() for o in outs]
+#     return [t.upper() for t in toks if t]
 def _extract_tokens(market: dict) -> list[str]:
-    outs = market.get("outcomes") or []
-    if outs and isinstance(outs[0], dict):
-        toks = [(o.get("token") or o.get("display") or o.get("name") or "").strip() for o in outs]
-    else:
-        toks = [str(o).strip() for o in outs]
-    return [t.upper() for t in toks if t]
+    """Return the list of token strings from market['outcomes'], preserving casing."""
+    return [o["token"] for o in market.get("outcomes", []) if isinstance(o, dict) and "token" in o]
 
 def interpret_market(srv: dict) -> Tuple[bool, str]:
     try:
@@ -216,6 +219,13 @@ def discover_markets() -> List[dict]:
         ids = {MARKET_ID_DEFAULT}
     return [fetch_market(mid) for mid in sorted(ids)]
 
+@st.cache_data(ttl=5, show_spinner=False)
+def fetch_user_detail(user_id: int) -> dict:
+    try:
+        return _get(f"/users/{user_id}", 8.0)
+    except Exception:
+        return {}
+    
 def load_users_df(users_raw: pd.DataFrame) -> pd.DataFrame:
     df = users_raw.copy()
     if "id" not in df.columns and "user_id" in df.columns:
@@ -452,8 +462,6 @@ if missing_tokens:
 # Order rows to match TOKENS_SELECTED using a categorical sort (no set_index/reindex)
 res_df["_order"] = pd.Categorical(res_df["Token"], categories=TOKENS_SELECTED, ordered=True)
 res_df = res_df.sort_values("_order").drop(columns="_order").reset_index(drop=True)
-
-print("3:", res_df)
 
 # Totals
 res_tot_usdc = float(res_df["USDC"].sum())
@@ -969,73 +977,158 @@ with tab3:
                     #     height=height
                     # )
                     # st.plotly_chart(fig_h, use_container_width=True)
-
+# ================================
+# Leaderboard (Selected Market)
+# ================================
 st.divider()
 
-# ================================
-# Leaderboard (selected)
-# ================================
 st.subheader("🏆 Leaderboard (Selected Market)")
 
 tx_lead = tx_norm_selected.copy()
 if tx_lead.empty:
     st.info("No transactions in this market yet.")
 else:
-    # Prices now
-    reserves_latest = m_selected.get('reserves') or []
-    res_map_shares = {r["token"]: int(r["shares"]) for r in reserves_latest}
-    tokens_for_lead = _extract_tokens(m_selected) or BINARY_OUTCOME_TOKENS
-    price_now = {t: float(buy_curve(res_map_shares.get(t, 0))) for t in tokens_for_lead}
+    # Ensure numeric types
+    for c in ["BuyAmt_Delta", "SellAmt_Delta"]:
+        if c not in tx_lead.columns:
+            tx_lead[c] = 0.0
+        tx_lead[c] = pd.to_numeric(tx_lead[c], errors="coerce").fillna(0.0)
 
-    # Minimal view for holdings rebuild
-    txx = tx_lead[["Time","user_id","Action","Outcome","Quantity"]].copy()
-    users_df_simple = users_df_all[["id","username","balance"]].copy()
-    holdings_now = rebuild_holdings_now(txx, users_df_simple, tokens_for_lead)
+    # Make sure we have a User column for display
+    tx_lead = ensure_user_column(tx_lead, users_df_all)
+    # Do we have any Resolve rows in this market?
+    has_resolve = (tx_lead["Action"] == "Resolve").any()
 
-    lb_rows = []
-    for _, u in users_df_simple.iterrows():
-        uid = int(u["id"])
-        bal_now = float(u.get("balance", 0.0))
-        shares_val = sum(holdings_now.get(uid, {}).get(t, 0) * price_now[t] for t in tokens_for_lead)
-        pv_now = bal_now + shares_val
-        lb_rows.append({"User": u["username"], "PortfolioValue": pv_now})
-    latest = pd.DataFrame(lb_rows)
+    # --- Cashflow aggregates
+    buys = (
+        tx_lead[tx_lead["Action"] == "Buy"]
+        .groupby("user_id", as_index=False)["BuyAmt_Delta"]
+        .sum()
+        .rename(columns={"BuyAmt_Delta": "sum_buy"})
+    )
+    sells = (
+        tx_lead[tx_lead["Action"] == "Sell"]
+        .groupby("user_id", as_index=False)["SellAmt_Delta"]
+        .sum()
+        .rename(columns={"SellAmt_Delta": "sum_sell"})
+    )
+
+    agg = (
+        users_df_all[["id", "username"]]
+        .rename(columns={"id": "user_id", "username": "User"})
+        .merge(buys, on="user_id", how="left")
+        .merge(sells, on="user_id", how="left")
+        .fillna({"sum_buy": 0.0, "sum_sell": 0.0})
+    )
+
+    if has_resolve:
+        # Include resolve payouts in PV; holdings should be zeroed by then
+        resolves = (
+            tx_lead[tx_lead["Action"] == "Resolve"]
+            .groupby("user_id", as_index=False)["SellAmt_Delta"]
+            .sum()
+            .rename(columns={"SellAmt_Delta": "sum_resolve"})
+        )
+        agg = agg.merge(resolves, on="user_id", how="left").fillna({"sum_resolve": 0.0})
+        agg["PortfolioValue"] = agg["sum_sell"] + agg["sum_resolve"] - agg["sum_buy"]
+
+        agg["PctGainLoss"] = np.where(
+            agg["sum_buy"] > 0.0,
+            (agg.get("sum_resolve", 0.0) - agg["sum_buy"]) / agg["sum_buy"] * 100.0,
+            np.nan
+        )       
+        # Standalone metric: total payout across winners
+        final_reserves = float(
+            pd.to_numeric(
+                tx_lead.loc[tx_lead["Action"] == "Resolve", "SellAmt_Delta"],
+                errors="coerce"
+            ).fillna(0.0).sum()
+        )
+        st.metric("Final Reserves (Total Winner Payouts)", f"${final_reserves:,.2f}")
+
+        # User-level payouts (for display)
+        payouts_df = (
+            tx_lead.loc[tx_lead["Action"] == "Resolve", ["user_id", "SellAmt_Delta"]]
+            .groupby("user_id", as_index=False)
+            .agg(Payout=("SellAmt_Delta", "sum"))
+            .merge(
+                users_df_all[["id", "username"]].rename(columns={"id": "user_id", "username": "User"}),
+                on="user_id", how="left"
+            )[["User", "Payout"]]
+        )
+        payouts_df["Payout"] = pd.to_numeric(payouts_df["Payout"], errors="coerce").fillna(0.0)
+
+    else:
+        # --- UNRESOLVED: add mark-to-market value of current holdings
+        # Current prices from latest reserves
+        reserves_latest = m_selected.get("reserves") or []
+        res_map_shares = {r["token"]: int(r.get("shares", 0)) for r in reserves_latest}
+        tokens_for_lead = _extract_tokens(m_selected)  # preserve casing
+        price_now = {t: float(buy_curve(res_map_shares.get(t, 0))) for t in tokens_for_lead}
+
+        # Rebuild current holdings per user (selected market scope)
+        txx = tx_lead[["Time", "user_id", "Action", "Outcome", "Quantity"]].copy()
+        users_df_simple = users_df_all[["id", "username", "balance"]].copy()  # balance not used here
+        holdings_now = rebuild_holdings_now(txx, users_df_simple, tokens_for_lead)
+
+        # Compute mark-to-market value for each user
+        m2m_rows = []
+        for _, urow in users_df_simple.iterrows():
+            uid = int(urow["id"])
+            hmap = holdings_now.get(uid, {})
+            value = sum((hmap.get(t, 0) or 0) * price_now.get(t, 0.0) for t in tokens_for_lead)
+            m2m_rows.append({"user_id": uid, "m2m_value": float(value)})
+
+        m2m_df = pd.DataFrame(m2m_rows)
+
+        agg = agg.merge(m2m_df, on="user_id", how="left").fillna({"m2m_value": 0.0})
+        # PV = realized cashflows + mark-to-market holdings
+        agg["PortfolioValue"] = agg["sum_sell"] - agg["sum_buy"] + agg["m2m_value"]
+        agg["PctGainLoss"] = np.where(
+            agg["sum_buy"] > 0.0,
+            (agg.get("m2m_value", 0.0) - agg["sum_buy"]) / agg["sum_buy"] * 100.0,
+            np.nan
+        )
+        # No resolve payouts yet
+        payouts_df = pd.DataFrame(columns=["User", "Payout"])
+
+    latest = agg[["User", "PortfolioValue", "PctGainLoss"]].copy()
     if not latest.empty and "User" in latest.columns:
         latest = latest[latest["User"].str.lower() != "admin"]
-    latest["PnL"] = latest["PortfolioValue"] - STARTING_BALANCE
 
-    payouts_df = (
-        tx_lead.loc[tx_lead["Action"] == "Resolve", ["user_id", "SellAmt_Delta"]]
-        .groupby("user_id", as_index=False)
-        .agg(Payout=("SellAmt_Delta", "sum"))
-    )
-    if not payouts_df.empty:
-        payouts_df = payouts_df.merge(
-            users_df_all[["id","username"]].rename(columns={"id":"user_id","username":"User"}),
-            on="user_id", how="left"
-        )[["User","Payout"]]
-    else:
-        payouts_df = pd.DataFrame(columns=["User","Payout"])
-    payouts_df["Payout"] = pd.to_numeric(payouts_df["Payout"], errors="coerce").fillna(0.0)
+    # Market-scoped view → baseline 0
+    latest["PnL"] = latest["PortfolioValue"] # quick fix
+
+    # Merge payouts (0 if none)
     latest = latest.merge(payouts_df, on="User", how="left")
     latest["Payout"] = latest["Payout"].fillna(0.0)
+    if has_resolve:
+        latest["PortfolioValue"] = latest["Payout"]
 
-    points_vol = compute_user_points(tx_lead, users_df_all[["id","username"]])
-    pnl_points = latest[["User","PnL"]].copy()
+    # Points (unchanged)
+    points_vol = compute_user_points(tx_lead, users_df_all[["id", "username"]])
+    pnl_points = latest[["User", "PnL"]].copy()
     pnl_points["PnLPoints"] = pnl_points["PnL"].clip(lower=0.0) * PNL_POINTS_PER_USD
-    pts = points_vol.merge(pnl_points[["User","PnLPoints"]], on="User", how="left")
+    pts = points_vol.merge(pnl_points[["User", "PnLPoints"]], on="User", how="left")
     pts["PnLPoints"] = pts["PnLPoints"].fillna(0.0)
     pts["TotalPoints"] = pts["VolumePoints"] + pts["PnLPoints"]
 
     latest = latest.merge(
-        pts[["User","VolumePoints","PnLPoints","TotalPoints"]],
+        pts[["User", "VolumePoints", "PnLPoints", "TotalPoints"]],
         on="User", how="left"
-    ).fillna({"VolumePoints":0.0, "PnLPoints":0.0, "TotalPoints":0.0})
+    ).fillna({"VolumePoints": 0.0, "PnLPoints": 0.0, "TotalPoints": 0.0})
 
-    metric_choice = st.radio("Leaderboard metric (sort by):",
-                             ["Portfolio Value", "PnL"],
-                             horizontal=True, key="lb_metric")
-    sort_key = {"Portfolio Value": "PortfolioValue", "PnL": "PnL"}[metric_choice]
+    metric_choice = st.radio(
+        "Leaderboard metric (sort by):",
+        ["Portfolio Value", "PnL", "% Gain/Loss"],
+        horizontal=True, key="lb_metric"
+    )
+    sort_key_map = {
+        "Portfolio Value": "PortfolioValue",
+        "PnL": "PnL",
+        "% Gain/Loss": "PctGainLoss",
+    }
+    sort_key = sort_key_map[metric_choice]
     latest = latest.sort_values(sort_key, ascending=False, kind="mergesort")
 
     if latest.empty:
@@ -1043,12 +1136,170 @@ else:
     else:
         top_cols = st.columns(min(3, len(latest)))
         for i, (_, row) in enumerate(latest.head(3).iterrows()):
-            delta_val = f"${row['PnL']:,.2f}" if row['PnL'] >= 0 else f"-${abs(row['PnL']):,.2f}"
+            delta_val = f"${row['PnL']:,.2f}" if row["PnL"] >= 0 else f"-${abs(row['PnL']):,.2f}"
             with top_cols[i]:
-                st.metric(label=f"#{i+1} {row['User']}",
-                          value=f"${row['PortfolioValue']:,.2f}",
-                          delta=delta_val,
-                          border=True)
+                st.metric(
+                    label=f"#{i+1} {row['User']}",
+                    value=f"${row['PortfolioValue']:,.2f}",
+                    delta=f"{row['PctGainLoss']:,.2f} %",
+                    border=True
+                )
                 st.caption(f"Payout: ${row['Payout']:,.2f}")
                 st.caption(f"Points: {row['TotalPoints']:,.0f}")
-        st.dataframe(latest[["User","Payout","PortfolioValue","PnL","VolumePoints","PnLPoints","TotalPoints"]])
+
+        st.dataframe(
+            latest[["User", "Payout", "PortfolioValue", "PnL", "VolumePoints", "PnLPoints", "TotalPoints"]]
+        )
+
+
+# ================================
+# Individual User Performance
+# ================================
+st.divider()
+st.subheader("👤 User Performance (All Markets)")
+
+# Pick user
+usernames = users_df_all["username"].astype(str).tolist()
+if not usernames:
+    st.info("No users available.")
+else:
+    pick_user = st.selectbox("Select user", sorted(usernames), index=0)
+
+    # Filter that user's tx across ALL markets
+    user_row = users_df_all[users_df_all["username"] == pick_user].head(1)
+    if user_row.empty:
+        st.info("Selected user not found.")
+    else:
+        uid = int(user_row.iloc[0]["id"])
+
+        # Normalize & restrict to user
+        tx_user = tx_norm_all.copy()
+
+        if not tx_user.empty:
+            tx_user = tx_user[tx_user["user_id"].eq(uid)].copy()
+            tx_user = tx_user.dropna(subset=["Time"]).sort_values("Time")
+
+        # --- Cash-only timeline: STARTING_BALANCE - Σ(buys) + Σ(sells+resolve)
+        if tx_user.empty:
+            st.info("No transactions for this user yet.")
+        else:
+            # Ensure numeric
+            for c in ["BuyAmt_Delta", "SellAmt_Delta"]:
+                if c not in tx_user.columns:
+                    tx_user[c] = 0.0
+                tx_user[c] = pd.to_numeric(tx_user[c], errors="coerce").fillna(0.0)
+
+            # Running cash
+            cash = []
+            running_cash = float(STARTING_BALANCE)
+            for _, r in tx_user.iterrows():
+                act = r.get("Action")
+                if act == "Buy":
+                    running_cash -= float(r["BuyAmt_Delta"] or 0.0)
+                elif act == "Sell":
+                    running_cash += float(r["SellAmt_Delta"] or 0.0)
+                elif act == "Resolve":
+                    running_cash += float(r["SellAmt_Delta"] or 0.0)
+                cash.append({"Time": r["Time"], "Cash": running_cash})
+
+            cash_df = pd.DataFrame(cash)
+            if not cash_df.empty:
+                fig_cash = px.line(
+                    cash_df, x="Time", y="Cash", title=f"Cash Over Time — {pick_user}"
+                )
+                fig_cash.update_yaxes(range=[0, 200000])
+                st.plotly_chart(fig_cash, use_container_width=True)
+
+        # --- Static snapshot: balance + Σ(owned shares * price)
+        detail = fetch_user_detail(uid) or {}
+
+        bal_now = float(detail.get("balance", 0.0))
+        holdings_list = detail.get("holdings", []) or []  # unresolved only
+
+        # Prefer API-provided value; fallback to shares*price if needed
+        current_hold_value = 0.0
+        owned_rows = []
+        for h in holdings_list:
+            mid = h.get("market_id")
+            tok = h.get("token")
+            sh = float(h.get("shares", 0))
+            pr = float(h.get("price", 0.0))
+            val = h.get("value", None)
+            if val is None:
+                val = sh * pr
+            val = float(val or 0.0)
+            current_hold_value += val
+            owned_rows.append({
+                "Market": mid,
+                "Token": tok,
+                "Price": pr,
+                "Shares": int(sh),
+                "Value": val
+            })
+
+        # 🔹 Remove rows with zero shares
+        owned_rows = [r for r in owned_rows if r["Shares"] > 0]
+
+        current_portfolio_value = bal_now + current_hold_value
+        pct_gain_loss = (
+            (current_portfolio_value - float(STARTING_BALANCE)) / float(STARTING_BALANCE) * 100.0
+            if float(STARTING_BALANCE) > 0 else float("nan")
+        )
+
+        mc = st.columns(3)
+        with mc[0]:
+            st.metric("Current Portfolio Value", f"${current_portfolio_value:,.2f}")
+        with mc[1]:
+            st.metric("Balance (Cash)", f"${bal_now:,.2f}")
+        with mc[2]:
+            st.metric("% Gain/Loss vs Start", f"{pct_gain_loss:.2f}%")
+
+        st.caption("Holdings are **unresolved** positions only (live snapshot from `/users/{user_id}`).")
+
+        # --- Map out all shares owned with price, quantity, value
+        owned_df = pd.DataFrame(owned_rows)
+        if owned_df.empty:
+            st.info("No current holdings.")
+        else:
+            # Optional: sort by value desc
+            owned_df = owned_df.sort_values("Value", ascending=False)
+            st.dataframe(
+                owned_df[["Market", "Token", "Price", "Shares", "Value"]],
+                use_container_width=True
+            )
+
+    # Optional: visual breakdown of holdings by value
+    try:
+        fig_pos = px.bar(
+            owned_df,
+            x="Token",
+            y="Value",
+            color="Token",
+            title="Owned Positions — Value by Token",
+            text="Shares"
+        )
+        fig_pos.update_traces(textposition="outside")
+
+        # Compute y-axis range with headroom (~15%)
+        y_max = owned_df["Value"].max() if not owned_df.empty else 0
+        y_pad = y_max * 0.15  # 15% padding on top
+
+        fig_pos.update_layout(
+            bargap=0.4,          # space between groups of bars (0–1)
+            bargroupgap=0.2,     # space between bars in same group
+            xaxis_title=None,
+            yaxis_title="Value ($)",
+            uniformtext_minsize=8,
+            uniformtext_mode="hide",
+            yaxis=dict(range=[0, y_max + y_pad]),  # add y buffer
+            height=400,
+        )
+
+        # Fix bar width consistency when few tokens
+        if len(owned_df) <= 3:
+            fig_pos.update_xaxes(categoryorder="total descending", range=[-0.5, len(owned_df) - 0.5])
+            fig_pos.update_layout(bargap=0.8)
+
+        st.plotly_chart(fig_pos, use_container_width=True)
+    except Exception as e:
+        st.warning(f"Chart rendering failed: {e}")
